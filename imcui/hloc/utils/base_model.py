@@ -44,13 +44,13 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
 
 
 def dynamic_load(root, model):
-    module_path = f"{root.__name__}.{model}"
-    module = __import__(module_path, fromlist=[""])
+    module_path = f"{root.__name__}.{model}" # imcui.hloc.matches.matchanything
+    module = __import__(module_path, fromlist=[""]) # imcui.hloc.matchers.matchanything from '/home/sebastiangarcia/projects/swappr/src/MatchAnything/imcui/hloc/matchers/matchanything.py'
     classes = inspect.getmembers(module, inspect.isclass)
     # Filter classes defined in the module
-    classes = [c for c in classes if c[1].__module__ == module_path]
+    classes = [c for c in classes if c[1].__module__ == module_path] # [('BaseModel', <class 'imcui.hloc.utils.base_model.BaseModel'>), ('MatchAnything', <class 'imcui.hloc.matchers.matchanything.MatchAnything'>), ('PL_LoFTR', <class 'MatchAnything.src.lightning.lightning_loftr.PL_LoFTR'>), ('Path', <class 'pathlib.Path'>)]
     # Filter classes inherited from BaseModel
-    classes = [c for c in classes if issubclass(c[1], BaseModel)]
+    classes = [c for c in classes if issubclass(c[1], BaseModel)] # [('MatchAnything', <class 'imcui.hloc.matchers.matchanything.MatchAnything'>)]
     assert len(classes) == 1, classes
     return classes[0][1]
     # return getattr(module, 'Model')

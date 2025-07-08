@@ -1000,9 +1000,9 @@ def match_images(model, image_0, image_1, conf, device="cpu"):
 
     image0, scale0 = preprocess(image0)
     image1, scale1 = preprocess(image1)
-    image0 = image0.to(device)[None]
-    image1 = image1.to(device)[None]
-    pred = model({"image0": image0, "image1": image1})
+    image0 = image0.to(device)[None] # (1, 3, 480, 640)
+    image1 = image1.to(device)[None] # # (1, 3, 480, 640)
+    pred = model({"image0": image0, "image1": image1}) # pred is a dict with keys: keypoints0 -> tensor.size([N, 2]), keypoints1 -> tensor.size([N, 2]), mconf tensor.Size([N])
 
     s0 = np.array(image_0.shape[:2][::-1]) / np.array(image0.shape[-2:][::-1])
     s1 = np.array(image_1.shape[:2][::-1]) / np.array(image1.shape[-2:][::-1])

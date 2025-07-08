@@ -170,8 +170,8 @@ def get_model(match_conf: Dict[str, Any]):
     Returns:
         A matcher model instance.
     """
-    Model = dynamic_load(matchers, match_conf["model"]["name"])
-    model = Model(match_conf["model"]).eval().to(DEVICE)
+    Model = dynamic_load(matchers, match_conf["model"]["name"]) # <class 'imcui.hloc.matchers.matchanything.MatchAnything'>
+    model = Model(match_conf["model"]).eval().to(DEVICE) # pytorch model instance of
     return model
 
 
