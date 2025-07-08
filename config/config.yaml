@@ -1,0 +1,47 @@
+server:
+  name: "0.0.0.0"
+  port: 16010
+
+defaults:
+  setting_threshold: 0.1
+  max_keypoints: 2000
+  keypoint_threshold: 0.05
+  enable_ransac: true
+  ransac_method: CV2_USAC_MAGSAC
+  ransac_reproj_threshold: 8
+  ransac_confidence: 0.999
+  ransac_max_iter: 10000
+  ransac_num_samples: 4
+  match_threshold: 0.2
+  setting_geometry: Homography
+
+matcher_zoo:
+  matchanything_eloftr:
+    matcher: matchanything_eloftr
+    dense: true
+    info:
+      name: Efficient LoFTR #dispaly name
+      source: "CVPR 2024"
+      # github: https://github.com/zju3dv/efficientloftr
+      # paper: https://zju3dv.github.io/efficientloftr/files/EfficientLoFTR.pdf
+      # project: https://zju3dv.github.io/efficientloftr
+      display: true
+
+  matchanything_roma:
+    matcher: matchanything_roma
+    dense: true
+    info:
+      name: ROMA #dispaly name
+      source: "CVPR 2024"
+      # github: https://github.com/zju3dv/efficientloftr
+      # paper: https://zju3dv.github.io/efficientloftr/files/EfficientLoFTR.pdf
+      # project: https://zju3dv.github.io/efficientloftr
+      display: true
+
+retrieval_zoo:
+  netvlad:
+    enable: true
+  openibl:
+    enable: true
+  cosplace:
+    enable: true
