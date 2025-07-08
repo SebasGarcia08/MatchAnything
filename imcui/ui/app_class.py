@@ -23,7 +23,7 @@ import os
 # GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 # GOOGLE_TOKEN = os.environ.get('GOOGLE_TOKEN')
 GOOGLE_TOKEN = "12L3g9-w8rR9K2L4rYaGaDJ7NqX1D713d"
-os.system(f"cd {str(Path(__file__).parent / '../third_party')} && cd MatchAnything && gdown {GOOGLE_TOKEN} && unzip weights.zip")
+#os.system(f"cd {str(Path(__file__).parent / '../third_party')} && cd MatchAnything && gdown {GOOGLE_TOKEN} && unzip weights.zip")
 # if not (Path(__file__).parent / "../third_party/MatchAnything").exists():
 #     print("**********************************")
     # os.system(f"cd {str(Path(__file__).parent / '../third_party')} && git clone https://{GITHUB_TOKEN}@github.com/hxy-123/MatchAnything_HF.git && mv MatchAnything_HF MatchAnything && cd MatchAnything && gdown {GOOGLE_TOKEN} && unzip weights.zip")

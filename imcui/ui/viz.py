@@ -245,19 +245,36 @@ def error_colormap(err, thr, alpha=1.0):
 
 def fig2im(fig: matplotlib.figure.Figure) -> np.ndarray:
     """
-    Convert a matplotlib figure to a numpy array with RGB values.
+    Convert a Matplotlib Figure to an RGB NumPy array.
+
+    Handles both old (<3.10) and new (≥3.10) Matplotlib APIs.
 
     Args:
-        fig: A matplotlib figure.
+        fig: A Matplotlib Figure instance.
 
     Returns:
-        A numpy array with shape (height, width, 3) and dtype uint8 containing
-        the RGB values of the figure.
+        np.ndarray with shape (height, width, 3) and dtype uint8
+        containing the figure’s RGB pixels.
     """
+    # Ensure the renderer has produced the pixel buffer
     fig.canvas.draw()
-    (width, height) = fig.canvas.get_width_height()
-    buf_ndarray = np.frombuffer(fig.canvas.tostring_rgb(), dtype="u1")
-    return buf_ndarray.reshape(height, width, 3)
+
+    # Canvas returns (width, height)
+    width, height = fig.canvas.get_width_height()
+
+    try:
+        # Matplotlib < 3.10 (API still present)
+        buf = fig.canvas.tostring_rgb()
+        img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+
+    except AttributeError:
+        # Matplotlib ≥ 3.10: use buffer_rgba() then drop alpha channel
+        buf = fig.canvas.buffer_rgba()           # memory-view, RGBA
+        img = (np.frombuffer(buf, dtype=np.uint8)
+                 .reshape(height, width, 4)[..., :3])
+
+    return img
+
 
 def dynamic_alpha(n_matches,
                   milestones=[0, 300, 1000, 2000],
