@@ -508,6 +508,62 @@ def filter_matches_ransac(
     return result
 
 
+def warp_images_simple(
+    filtered_prediction: FilteredMatchPrediction,
+    geom_type: str = "Homography",
+    log_timing: bool = False
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Warp images using the estimated homography matrix, replicating wrap_images functionality.
+    
+    Args:
+        filtered_prediction: FilteredMatchPrediction from filter_matches_ransac
+        geom_type: Type of geometry ("Homography" or "Fundamental")
+        log_timing: Whether to log processing time
+        
+    Returns:
+        Tuple of (visualization image, warped image1) or (None, None) if failed
+    """
+    if log_timing:
+        t0 = time.time()
+    
+    # Check if we have a valid homography matrix
+    if len(filtered_prediction["H"]) == 0:
+        if log_timing:
+            print("No homography matrix available, cannot warp images")
+        return None, None
+    
+    img0 = filtered_prediction["image0_orig"]
+    img1 = filtered_prediction["image1_orig"] 
+    H = filtered_prediction["H"]
+    
+    h0, w0, _ = img0.shape
+    h1, w1, _ = img1.shape
+    
+    try:
+        if geom_type == "Homography":
+            # Warp img1 to img0's perspective using the homography matrix
+            import cv2
+            rectified_image1 = cv2.warpPerspective(img1, H, (w0, h0))
+            
+            # Create side-by-side visualization like the original
+            # Concatenate images horizontally for comparison
+            combined_img = np.concatenate([img0, rectified_image1], axis=1)
+            
+            if log_timing:
+                print(f"Image warping completed in {time.time() - t0:.3f}s")
+                
+            return combined_img, rectified_image1
+            
+        else:
+            print(f"Geometry type {geom_type} not supported in simplified pipeline")
+            return None, None
+            
+    except Exception as e:
+        print(f"Image warping failed with error: {e}")
+        return None, None
+
+
 #%% [markdown]
 # ## Test the simplified pipeline
 
@@ -544,6 +600,22 @@ eloftr_filtered = filter_matches_ransac(
 print(f"ELoFTR filtered matches: {len(eloftr_filtered['mmkpts0'])}")
 if len(eloftr_filtered['H']) > 0:
     print(f"Homography matrix shape: {eloftr_filtered['H'].shape}")
+    
+    # Warp images for visual verification
+    eloftr_warped_viz, eloftr_warped_img = warp_images_simple(
+        eloftr_filtered,
+        log_timing=True
+    )
+    
+    if eloftr_warped_viz is not None:
+        plt.figure(figsize=(15, 8))
+        plt.imshow(eloftr_warped_viz)
+        plt.title("ELoFTR - Original Image 0 | Warped Image 1", fontsize=16)
+        plt.axis('off')
+        plt.show()
+        print("ELoFTR warping successful!")
+    else:
+        print("ELoFTR warping failed")
 
 #%%
 # Test with ROMA
@@ -569,6 +641,22 @@ roma_filtered = filter_matches_ransac(
 print(f"ROMA filtered matches: {len(roma_filtered['mmkpts0'])}")
 if len(roma_filtered['H']) > 0:
     print(f"Homography matrix shape: {roma_filtered['H'].shape}")
+    
+    # Warp images for visual verification
+    roma_warped_viz, roma_warped_img = warp_images_simple(
+        roma_filtered,
+        log_timing=True
+    )
+    
+    if roma_warped_viz is not None:
+        plt.figure(figsize=(15, 8))
+        plt.imshow(roma_warped_viz)
+        plt.title("ROMA - Original Image 0 | Warped Image 1", fontsize=16)
+        plt.axis('off')
+        plt.show()
+        print("ROMA warping successful!")
+    else:
+        print("ROMA warping failed")
 
 #%% [markdown]
 # ## Performance Comparison
@@ -623,5 +711,67 @@ print("Recommended usage:")
 print("1. Load models once at startup with load_matchanything_model()")
 print("2. For each frame pair, call run_matching_simple() + filter_matches_ransac()")
 print("3. Use the homography matrix for logo replacement")
+
+#%% [markdown]
+# ## Visual Verification: Original vs Simplified Pipeline
+
+#%%
+# Compare warped images from original vs simplified pipeline
+print("\n=== Visual Verification: Original vs Simplified ===")
+
+# Display side-by-side comparison
+fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+
+# Row 1: ELoFTR comparison
+if output_wrapped_eloftr is not None and eloftr_warped_viz is not None:
+    axes[0, 0].imshow(output_wrapped_eloftr)
+    axes[0, 0].set_title("ELoFTR - Original Pipeline Warped", fontsize=14)
+    axes[0, 0].axis('off')
+    
+    axes[0, 1].imshow(eloftr_warped_viz)
+    axes[0, 1].set_title("ELoFTR - Simplified Pipeline Warped", fontsize=14)
+    axes[0, 1].axis('off')
+else:
+    axes[0, 0].text(0.5, 0.5, "Original ELoFTR warping not available", 
+                   ha='center', va='center', transform=axes[0, 0].transAxes)
+    axes[0, 1].text(0.5, 0.5, "Simplified ELoFTR warping not available", 
+                   ha='center', va='center', transform=axes[0, 1].transAxes)
+
+# Row 2: ROMA comparison  
+if output_wrapped_roma is not None and roma_warped_viz is not None:
+    axes[1, 0].imshow(output_wrapped_roma)
+    axes[1, 0].set_title("ROMA - Original Pipeline Warped", fontsize=14)
+    axes[1, 0].axis('off')
+    
+    axes[1, 1].imshow(roma_warped_viz)
+    axes[1, 1].set_title("ROMA - Simplified Pipeline Warped", fontsize=14)
+    axes[1, 1].axis('off')
+else:
+    axes[1, 0].text(0.5, 0.5, "Original ROMA warping not available", 
+                   ha='center', va='center', transform=axes[1, 0].transAxes)
+    axes[1, 1].text(0.5, 0.5, "Simplified ROMA warping not available", 
+                   ha='center', va='center', transform=axes[1, 1].transAxes)
+
+for i in range(2):
+    for j in range(2):
+        axes[i, j].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# Print comparison summary
+print("\n=== Results Comparison Summary ===")
+print("ELoFTR:")
+print(f"  Original Pipeline - Raw: {num_matches_eloftr['num_raw_matches']}, RANSAC: {num_matches_eloftr['num_ransac_matches']}")
+print(f"  Simplified Pipeline - Raw: {len(eloftr_prediction['mkpts0'])}, RANSAC: {len(eloftr_filtered['mmkpts0'])}")
+
+print("\nROMA:")
+print(f"  Original Pipeline - Raw: {num_matches_roma['num_raw_matches']}, RANSAC: {num_matches_roma['num_ransac_matches']}")
+print(f"  Simplified Pipeline - Raw: {len(roma_prediction['mkpts0'])}, RANSAC: {len(roma_filtered['mmkpts0'])}")
+
+print("\nVisual Verification:")
+print("✅ Compare the warped images above - they should look identical!")
+print("✅ Check that match counts are the same between original and simplified pipelines")
+print("✅ The simplified pipeline should be significantly faster for semi-real-time usage")
 
 # %%
