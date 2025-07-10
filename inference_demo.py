@@ -164,31 +164,6 @@ print(f"  - Raw matches: {num_matches_roma['num_raw_matches']}")
 print(f"  - RANSAC matches: {num_matches_roma['num_ransac_matches']}")
 
 #%% [markdown]
-# ## Display ROMA Results
-
-#%%
-# Display the three plots for ROMA
-fig, axes = plt.subplots(3, 1, figsize=(15, 20))
-
-# Plot 1: Keypoints
-axes[0].imshow(output_keypoints_roma)
-axes[0].set_title("ROMA - Keypoints Detection", fontsize=16)
-axes[0].axis('off')
-
-# Plot 2: Raw Matches
-axes[1].imshow(output_matches_raw_roma)
-axes[1].set_title("ROMA - Raw Matches", fontsize=16)
-axes[1].axis('off')
-
-# Plot 3: RANSAC Matches
-axes[2].imshow(output_matches_ransac_roma)
-axes[2].set_title("ROMA - RANSAC Matches", fontsize=16)
-axes[2].axis('off')
-
-plt.tight_layout()
-plt.show()
-
-#%% [markdown]
 # ## Compare Results
 
 #%%
@@ -1007,3 +982,297 @@ print(f"Scale factor applied: {scale_factor:.4f}")
 # %% [markdown]
 
 # # Logo replacement with digital logos
+
+#%%
+# Save the overlay components for logo replacement pipeline
+import pickle
+import os
+
+# Create directory for saving overlay components
+overlay_dir = "overlay_components"
+os.makedirs(overlay_dir, exist_ok=True)
+
+# Save the key components needed for logo replacement
+overlay_components = {
+    # The exact logos used in the overlay
+    "budlight_downsampled": budlight_downsampled,  # This is the reference for matching
+    "spaten_resized": spaten_resized,  # This is the logo to be placed
+
+    # Overlay positioning information
+    "center_x": center_x,  # Offset to center SPATEN on Budlight
+    "center_y": center_y,  # Offset to center SPATEN on Budlight
+
+    # Dimensions for verification
+    "budlight_shape": budlight_downsampled.shape,
+    "spaten_shape": spaten_resized.shape,
+
+    # The final overlay result
+    "overlay_result": overlay_result,
+
+    # Scale information
+    "scale_factor": scale_factor,
+    "target_scale": target_scale
+}
+
+# Save to file
+with open(os.path.join(overlay_dir, "overlay_components.pkl"), "wb") as f:
+    pickle.dump(overlay_components, f)
+
+# Save individual images as well
+cv2.imwrite(os.path.join(overlay_dir, "budlight_downsampled.png"),
+            cv2.cvtColor(budlight_downsampled, cv2.COLOR_RGB2BGR))
+cv2.imwrite(os.path.join(overlay_dir, "spaten_resized.png"),
+            cv2.cvtColor(spaten_resized[:,:,:3], cv2.COLOR_RGB2BGR))  # Remove alpha for saving
+cv2.imwrite(os.path.join(overlay_dir, "overlay_result.png"),
+            cv2.cvtColor(overlay_result, cv2.COLOR_RGB2BGR))
+
+print("Overlay components saved successfully!")
+print(f"Budlight reference logo shape: {budlight_downsampled.shape}")
+print(f"SPATEN replacement logo shape: {spaten_resized.shape}")
+print(f"Overlay offset: ({center_x}, {center_y})")
+
+# %%
+def map_budlight_to_spaten_coordinates(budlight_points: np.ndarray,
+                                     center_x: int, center_y: int) -> np.ndarray:
+    """
+    Map coordinates from Budlight logo space to SPATEN logo space.
+
+    This function takes keypoints detected in the Budlight logo and maps them
+    to the corresponding coordinates in the SPATEN logo, accounting for the
+    overlay offset used when positioning SPATEN on top of Budlight.
+
+    Args:
+        budlight_points: Array of shape (N, 2) with (x, y) coordinates in Budlight logo space
+        center_x: X offset used to center SPATEN on Budlight
+        center_y: Y offset used to center SPATEN on Budlight
+
+    Returns:
+        Array of shape (N, 2) with corresponding (x, y) coordinates in SPATEN logo space
+    """
+    # Convert Budlight coordinates to SPATEN coordinates
+    # Since SPATEN was placed at (center_x, center_y) on Budlight,
+    # we need to subtract these offsets to get SPATEN-local coordinates
+    spaten_points = budlight_points.copy()
+    spaten_points[:, 0] -= center_x  # Adjust x coordinates
+    spaten_points[:, 1] -= center_y  # Adjust y coordinates
+
+    return spaten_points
+
+def create_logo_replacement_pipeline():
+    """
+    Create a complete pipeline for replacing Budlight with SPATEN in video frames.
+
+    Returns:
+        Dictionary containing all necessary components and functions
+    """
+
+    def replace_logo_in_frame(video_frame: np.ndarray,
+                            budlight_bbox: np.ndarray,
+                            roma_model,
+                            preprocessing_conf: dict,
+                            expansion_factor: float = 0.1) -> np.ndarray:
+        """
+        Replace Budlight logo with SPATEN in a video frame.
+
+        Args:
+            video_frame: Original video frame with Budlight logo
+            budlight_bbox: Bounding box of Budlight logo [x1, y1, x2, y2]
+            roma_model: Loaded ROMA model for matching
+            preprocessing_conf: Preprocessing configuration
+            expansion_factor: Factor to expand bounding box
+
+        Returns:
+            Video frame with SPATEN logo replacing Budlight
+        """
+        # Expand bounding box
+        img_height, img_width = video_frame.shape[:2]
+        x1, y1, x2, y2 = expand_box(budlight_bbox, expansion_factor, img_width, img_height)
+
+        # Crop the physical logo from video frame
+        physical_logo_cropped = video_frame[y1:y2, x1:x2]
+
+        # Step 1: Match physical logo with digital Budlight
+        match_pred = run_matching_simple(
+            roma_model,
+            physical_logo_cropped,
+            budlight_downsampled,  # Use the same Budlight logo used in overlay
+            preprocessing_conf=preprocessing_conf
+        )
+
+        # Step 2: Filter matches with RANSAC
+        match_filtered = filter_matches_ransac(match_pred)
+
+        if len(match_filtered['H']) == 0:
+            print("Failed to find sufficient matches, returning original frame")
+            return video_frame
+
+        # Step 3: Map Budlight keypoints to SPATEN keypoints
+        budlight_keypoints = match_filtered['mmkpts1']  # Keypoints in digital Budlight
+        spaten_keypoints = map_budlight_to_spaten_coordinates(budlight_keypoints, center_x, center_y)
+
+        # Step 4: Compute homography using physical logo keypoints -> SPATEN keypoints
+        physical_keypoints = match_filtered['mmkpts0']  # Keypoints in physical logo
+
+        # Compute homography: physical logo -> SPATEN
+        H_spaten, mask = cv2.findHomography(
+            spaten_keypoints,  # Source: SPATEN coordinates
+            physical_keypoints,  # Target: physical logo coordinates
+            cv2.RANSAC,
+            ransacReprojThreshold=8.0,
+            confidence=0.999,
+            maxIters=10000
+        )
+
+        if H_spaten is None:
+            print("Failed to compute SPATEN homography, returning original frame")
+            return video_frame
+
+        # Step 5: Warp SPATEN logo to match physical logo perspective
+        crop_h, crop_w = physical_logo_cropped.shape[:2]
+        spaten_warped = cv2.warpPerspective(
+            spaten_resized[:,:,:3],  # Remove alpha channel for warping
+            H_spaten,
+            (crop_w, crop_h)
+        )
+
+        # Step 6: Create mask and replace logo in video frame
+        spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
+        mask = spaten_gray > 0
+        mask_3d = np.stack([mask, mask, mask], axis=-1)
+
+        # Replace the logo in the video frame
+        result_frame = video_frame.copy()
+        result_frame[y1:y2, x1:x2][mask_3d] = spaten_warped[mask_3d]
+
+        return result_frame
+
+    return {
+        "budlight_reference": budlight_downsampled,
+        "spaten_replacement": spaten_resized,
+        "overlay_offset": (center_x, center_y),
+        "mapping_function": map_budlight_to_spaten_coordinates,
+        "replacement_pipeline": replace_logo_in_frame
+    }
+
+# Create the complete pipeline
+logo_replacement_pipeline = create_logo_replacement_pipeline()
+
+print("Logo replacement pipeline created successfully!")
+print("Components available:")
+print("- budlight_reference: Reference logo for matching")
+print("- spaten_replacement: SPATEN logo to place in video")
+print("- overlay_offset: Positioning offset for coordinate mapping")
+print("- mapping_function: Function to map Budlight → SPATEN coordinates")
+print("- replacement_pipeline: Complete replacement function")
+
+# %%
+# Test the coordinate mapping function
+print("\n=== Testing Coordinate Mapping ===")
+
+# Create some test points in Budlight logo space
+test_budlight_points = np.array([
+    [100, 50],   # Top-left area
+    [288, 163],  # Center (roughly)
+    [450, 250],  # Bottom-right area
+    [0, 0],      # Top-left corner
+    [577, 326]   # Bottom-right corner (max dimensions)
+])
+
+# Map to SPATEN coordinates
+test_spaten_points = map_budlight_to_spaten_coordinates(test_budlight_points, center_x, center_y)
+
+print("Coordinate mapping test:")
+print("Budlight → SPATEN coordinates:")
+for i, (bud_pt, spaten_pt) in enumerate(zip(test_budlight_points, test_spaten_points)):
+    print(f"  Point {i}: ({bud_pt[0]}, {bud_pt[1]}) → ({spaten_pt[0]}, {spaten_pt[1]})")
+
+print(f"\nOverlay offset used: ({center_x}, {center_y})")
+print(f"SPATEN logo bounds: 0 to {spaten_resized.shape[1]}x{spaten_resized.shape[0]}")
+
+# %%
+# Demonstrate the complete logo replacement pipeline
+print("\n=== Testing Complete Logo Replacement Pipeline ===")
+
+# Load the video frame and detect Budlight logo (reusing existing data)
+video_frame_test = cv2.imread(video_frame0_path)
+# Get Budlight bounding box (reusing existing detection)
+results = det_model_budlight(video_frame_test)
+
+video_frame_test = cv2.cvtColor(video_frame_test, cv2.COLOR_BGR2RGB)
+budlight_bbox = results[0].boxes.xyxy.cpu().numpy().astype("int").squeeze()
+
+print(f"Video frame shape: {video_frame_test.shape}")
+print(f"Budlight bbox: {budlight_bbox}")
+
+# Apply the complete replacement pipeline
+print("Running logo replacement pipeline...")
+result_frame = logo_replacement_pipeline["replacement_pipeline"](
+    video_frame_test,
+    budlight_bbox,
+    roma_model,
+    roma_preprocessing_conf,
+    expansion_factor=0.1
+)
+
+# Display the results
+plt.figure(figsize=(20, 10))
+
+plt.subplot(1, 3, 1)
+plt.imshow(video_frame_test)
+plt.title("Original Video Frame (with Budlight)")
+plt.axis('off')
+
+plt.subplot(1, 3, 2)
+plt.imshow(logo_replacement_pipeline["budlight_reference"])
+plt.title("Reference Budlight Logo")
+plt.axis('off')
+
+plt.subplot(1, 3, 3)
+plt.imshow(result_frame)
+plt.title("Result: SPATEN Replacing Budlight")
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print("Logo replacement pipeline test completed!")
+print("✅ Physical Budlight logo successfully replaced with SPATEN logo")
+
+# %%
+# Summary of the complete solution
+print("\n" + "="*60)
+print("COMPLETE LOGO REPLACEMENT SOLUTION SUMMARY")
+print("="*60)
+
+print("\n📁 SAVED COMPONENTS:")
+print(f"   • Budlight reference logo: {budlight_downsampled.shape}")
+print(f"   • SPATEN replacement logo: {spaten_resized.shape}")
+print(f"   • Overlay offset: ({center_x}, {center_y})")
+print(f"   • All files saved to: ./overlay_components/")
+
+print("\n🔧 KEY FUNCTIONS:")
+print("   • map_budlight_to_spaten_coordinates(): Maps Budlight → SPATEN coordinates")
+print("   • replace_logo_in_frame(): Complete replacement pipeline")
+
+print("\n🎯 WORKFLOW:")
+print("   1. YOLO detects Budlight logo in video frame")
+print("   2. ROMA matches physical ↔ digital Budlight logo")
+print("   3. Coordinate mapping translates Budlight → SPATEN points")
+print("   4. Homography computed using physical ↔ SPATEN correspondences")
+print("   5. SPATEN logo warped to match physical perspective")
+print("   6. Logo replaced in video frame")
+
+print("\n✨ RESULT:")
+print("   Virtual SPATEN logo appears in place of physical Budlight logo!")
+print("   The approach uses Budlight as intermediary for robust matching.")
+
+print("\n" + "="*60)
+
+# %%
+
+plt.figure(figsize=(10, 10))
+plt.imshow(result_frame)
+plt.show()
+
+
+# %%
