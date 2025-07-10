@@ -804,4 +804,206 @@ print("Logo replacement completed successfully!")
 print(f"Replaced logo using homography matrix with {len(match_filtered['mmkpts0'])} matched points")
 
 
+# %% [markdown]
+# # Swapping with digital logos
+
 # %%
+spaten_digital_logo_path = "/home/sebastiangarcia/projects/swappr/logo_id_data/digital/spaten_transparent.png"
+budlight_digital_logo_path = "/home/sebastiangarcia/projects/swappr/logo_id_data/digital/bud_light.png"
+
+# Load Spaten logo with alpha channel (transparency)
+spaten_digital_logo = cv2.imread(spaten_digital_logo_path, cv2.IMREAD_UNCHANGED)
+spaten_digital_logo = cv2.cvtColor(spaten_digital_logo, cv2.COLOR_BGRA2RGBA)
+
+# Load Budlight logo (no alpha channel)
+budlight_digital_logo = cv2.imread(budlight_digital_logo_path)
+budlight_digital_logo = cv2.cvtColor(budlight_digital_logo, cv2.COLOR_BGR2RGB)
+
+print(f"Spaten digital logo shape: {spaten_digital_logo.shape}")
+print(f"Budlight digital logo shape: {budlight_digital_logo.shape}")
+
+# Show original logos
+plt.figure(figsize=(15, 5))
+plt.subplot(1, 2, 1)
+plt.imshow(spaten_digital_logo)
+plt.title("Spaten Logo (with transparency)")
+plt.axis('off')
+
+plt.subplot(1, 2, 2)
+plt.imshow(budlight_digital_logo)
+plt.title("Budlight Logo (original)")
+plt.axis('off')
+plt.show()
+
+# %%
+# Downsample Budlight logo to half size
+budlight_half_height = budlight_digital_logo.shape[0] // 2
+budlight_half_width = budlight_digital_logo.shape[1] // 2
+
+budlight_downsampled = cv2.resize(budlight_digital_logo, (budlight_half_width, budlight_half_height), interpolation=cv2.INTER_AREA)
+
+print(f"Budlight downsampled shape: {budlight_downsampled.shape}")
+
+plt.figure(figsize=(8, 5))
+plt.imshow(budlight_downsampled)
+plt.title("Budlight Logo (downsampled to half size)")
+plt.axis('off')
+plt.show()
+
+# %%
+def overlay_with_transparency(background: np.ndarray, overlay: np.ndarray, x_offset: int, y_offset: int) -> np.ndarray:
+    """
+    Overlay an image with transparency (alpha channel) onto a background image.
+
+    Args:
+        background: Background image (H, W, 3) RGB
+        overlay: Overlay image (H, W, 4) RGBA with alpha channel
+        x_offset: X offset for overlay position
+        y_offset: Y offset for overlay position
+
+    Returns:
+        Combined image with overlay applied
+    """
+    # Create a copy of the background
+    result = background.copy()
+
+    # Get background dimensions
+    bg_h, bg_w = background.shape[:2]
+
+    # Get overlay dimensions
+    overlay_h, overlay_w = overlay.shape[:2]
+
+    # Calculate the region where overlay will be placed
+    # Handle cases where overlay extends beyond background bounds
+    start_x = max(0, x_offset)
+    start_y = max(0, y_offset)
+    end_x = min(bg_w, x_offset + overlay_w)
+    end_y = min(bg_h, y_offset + overlay_h)
+
+    # Calculate corresponding region in overlay
+    overlay_start_x = max(0, -x_offset)
+    overlay_start_y = max(0, -y_offset)
+    overlay_end_x = overlay_start_x + (end_x - start_x)
+    overlay_end_y = overlay_start_y + (end_y - start_y)
+
+    # Extract the region of interest from both images
+    bg_region = result[start_y:end_y, start_x:end_x]
+    overlay_region = overlay[overlay_start_y:overlay_end_y, overlay_start_x:overlay_end_x]
+
+    # Check if we have valid regions
+    if bg_region.shape[0] == 0 or bg_region.shape[1] == 0:
+        return result
+
+    # Extract RGB and alpha channels from overlay
+    overlay_rgb = overlay_region[:, :, :3]
+    alpha = overlay_region[:, :, 3] / 255.0  # Normalize alpha to [0, 1]
+
+    # Create alpha mask for broadcasting
+    alpha_mask = np.stack([alpha, alpha, alpha], axis=-1)
+
+    # Blend the images using alpha compositing
+    blended = overlay_rgb * alpha_mask + bg_region * (1 - alpha_mask)
+
+    # Update the result
+    result[start_y:end_y, start_x:end_x] = blended.astype(np.uint8)
+
+    return result
+
+# Calculate center position for overlaying Spaten on Budlight
+budlight_h, budlight_w = budlight_downsampled.shape[:2]
+spaten_h, spaten_w = spaten_digital_logo.shape[:2]
+
+print(f"Original Budlight dimensions: {budlight_w}x{budlight_h}")
+print(f"Original Spaten dimensions: {spaten_w}x{spaten_h}")
+
+# Calculate scaling factor to make Spaten fit nicely within Budlight
+# Let's make Spaten about 80% of Budlight's size so it fits well but remains prominent
+target_scale = 1.25
+target_width = int(budlight_w * target_scale)
+target_height = int(budlight_h * target_scale)
+
+# Calculate the actual scale factor needed to fit these dimensions
+scale_factor_w = target_width / spaten_w
+scale_factor_h = target_height / spaten_h
+scale_factor = min(scale_factor_w, scale_factor_h)  # Use the smaller scale to maintain aspect ratio
+
+print(f"Target Spaten dimensions: {target_width}x{target_height}")
+print(f"Scale factor: {scale_factor:.4f}")
+
+# Resize Spaten logo
+spaten_resized_w = int(spaten_w * scale_factor)
+spaten_resized_h = int(spaten_h * scale_factor)
+spaten_resized = cv2.resize(spaten_digital_logo, (spaten_resized_w, spaten_resized_h), interpolation=cv2.INTER_AREA)
+
+print(f"Resized Spaten dimensions: {spaten_resized_w}x{spaten_resized_h}")
+
+# Show the resized Spaten logo
+plt.figure(figsize=(10, 6))
+plt.imshow(spaten_resized)
+plt.title(f"Spaten Logo (resized to {spaten_resized_w}x{spaten_resized_h})")
+plt.axis('off')
+plt.show()
+
+# Center the resized Spaten logo on the Budlight logo
+center_x = (budlight_w - spaten_resized_w) // 2
+center_y = (budlight_h - spaten_resized_h) // 2
+
+print(f"Overlay position: ({center_x}, {center_y})")
+print(f"Spaten logo will extend beyond Budlight bounds: {spaten_resized_w > budlight_w or spaten_resized_h > budlight_h}")
+
+# Create the overlay with the resized Spaten logo
+overlay_result = overlay_with_transparency(budlight_downsampled, spaten_resized, center_x, center_y)
+
+# %%
+# Display the final result
+plt.figure(figsize=(15, 10))
+
+plt.subplot(2, 2, 1)
+plt.imshow(budlight_downsampled)
+plt.title("Budlight Logo (downsampled)")
+plt.axis('off')
+
+plt.subplot(2, 2, 2)
+plt.imshow(spaten_resized)
+plt.title(f"Spaten Logo (resized to {spaten_resized_w}x{spaten_resized_h})")
+plt.axis('off')
+
+plt.subplot(2, 2, 3)
+plt.imshow(overlay_result)
+plt.title("Spaten Overlaid on Budlight")
+plt.axis('off')
+
+plt.subplot(2, 2, 4)
+
+# Show a comparison - let's also create a version where we crop to show the full overlay
+extended_w = max(budlight_w, spaten_resized_w)
+extended_h = max(budlight_h, spaten_resized_h)
+extended_background = np.zeros((extended_h, extended_w, 3), dtype=np.uint8)
+
+# Place budlight in the center of extended background
+budlight_offset_x = (extended_w - budlight_w) // 2
+budlight_offset_y = (extended_h - budlight_h) // 2
+extended_background[budlight_offset_y:budlight_offset_y + budlight_h,
+                   budlight_offset_x:budlight_offset_x + budlight_w] = budlight_downsampled
+
+# Overlay resized Spaten in the center of extended background
+spaten_offset_x = (extended_w - spaten_resized_w) // 2
+spaten_offset_y = (extended_h - spaten_resized_h) // 2
+extended_overlay = overlay_with_transparency(extended_background, spaten_resized, spaten_offset_x, spaten_offset_y)
+
+plt.imshow(extended_overlay)
+plt.title("Full Overlay (showing extending parts)")
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print(f"Overlay completed!")
+print(f"Final overlay shape: {overlay_result.shape}")
+print(f"Extended overlay shape: {extended_overlay.shape}")
+print(f"Spaten was resized from {spaten_w}x{spaten_h} to {spaten_resized_w}x{spaten_resized_h}")
+print(f"Scale factor applied: {scale_factor:.4f}")
+
+# %% [markdown]
+
+# # Logo replacement with digital logos
