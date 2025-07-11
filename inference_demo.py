@@ -783,12 +783,29 @@ print(f"Replaced logo using homography matrix with {len(match_filtered['mmkpts0'
 # # Swapping with digital logos
 
 # %%
-spaten_digital_logo_path = "/home/sebastiangarcia/projects/swappr/logo_id_data/digital/spaten_transparent.png"
+# whether the spatten logo is transparent or not
+is_transparent = False
+
+if is_transparent:
+    # with transparent background
+    spaten_digital_logo_path = "/home/sebastiangarcia/projects/swappr/logo_id_data/digital/spaten_transparent.png"
+else:
+    # with floor color
+    spaten_digital_logo_path = "/home/sebastiangarcia/projects/swappr/logo_id_data/digital/spaten_fondo1.jpg"
+
 budlight_digital_logo_path = "/home/sebastiangarcia/projects/swappr/logo_id_data/digital/bud_light.png"
 
-# Load Spaten logo with alpha channel (transparency)
-spaten_digital_logo = cv2.imread(spaten_digital_logo_path, cv2.IMREAD_UNCHANGED)
-spaten_digital_logo = cv2.cvtColor(spaten_digital_logo, cv2.COLOR_BGRA2RGBA)
+# Load Spaten logo based on transparency flag
+if is_transparent:
+    # Load with alpha channel (transparency)
+    spaten_digital_logo = cv2.imread(spaten_digital_logo_path, cv2.IMREAD_UNCHANGED)
+    spaten_digital_logo = cv2.cvtColor(spaten_digital_logo, cv2.COLOR_BGRA2RGBA)
+    print(f"Loaded transparent Spaten logo with alpha channel: {spaten_digital_logo.shape}")
+else:
+    # Load without alpha channel (solid background)
+    spaten_digital_logo = cv2.imread(spaten_digital_logo_path)
+    spaten_digital_logo = cv2.cvtColor(spaten_digital_logo, cv2.COLOR_BGR2RGB)
+    print(f"Loaded non-transparent Spaten logo: {spaten_digital_logo.shape}")
 
 # Load Budlight logo (no alpha channel)
 budlight_digital_logo = cv2.imread(budlight_digital_logo_path)
@@ -801,7 +818,7 @@ print(f"Budlight digital logo shape: {budlight_digital_logo.shape}")
 plt.figure(figsize=(15, 5))
 plt.subplot(1, 2, 1)
 plt.imshow(spaten_digital_logo)
-plt.title("Spaten Logo (with transparency)")
+plt.title(f"Spaten Logo ({'with transparency' if is_transparent else 'with floor color'})")
 plt.axis('off')
 
 plt.subplot(1, 2, 2)
@@ -884,6 +901,53 @@ def overlay_with_transparency(background: np.ndarray, overlay: np.ndarray, x_off
 
     return result
 
+def overlay_without_transparency(background: np.ndarray, overlay: np.ndarray, x_offset: int, y_offset: int) -> np.ndarray:
+    """
+    Overlay an image without transparency onto a background image.
+
+    Args:
+        background: Background image (H, W, 3) RGB
+        overlay: Overlay image (H, W, 3) RGB
+        x_offset: X offset for overlay position
+        y_offset: Y offset for overlay position
+
+    Returns:
+        Combined image with overlay applied
+    """
+    # Create a copy of the background
+    result = background.copy()
+
+    # Get background dimensions
+    bg_h, bg_w = background.shape[:2]
+
+    # Get overlay dimensions
+    overlay_h, overlay_w = overlay.shape[:2]
+
+    # Calculate the region where overlay will be placed
+    # Handle cases where overlay extends beyond background bounds
+    start_x = max(0, x_offset)
+    start_y = max(0, y_offset)
+    end_x = min(bg_w, x_offset + overlay_w)
+    end_y = min(bg_h, y_offset + overlay_h)
+
+    # Calculate corresponding region in overlay
+    overlay_start_x = max(0, -x_offset)
+    overlay_start_y = max(0, -y_offset)
+    overlay_end_x = overlay_start_x + (end_x - start_x)
+    overlay_end_y = overlay_start_y + (end_y - start_y)
+
+    # Extract the region of interest from overlay
+    overlay_region = overlay[overlay_start_y:overlay_end_y, overlay_start_x:overlay_end_x]
+
+    # Check if we have valid regions
+    if overlay_region.shape[0] == 0 or overlay_region.shape[1] == 0:
+        return result
+
+    # Directly replace the background pixels with overlay pixels
+    result[start_y:end_y, start_x:end_x] = overlay_region
+
+    return result
+
 # Calculate center position for overlaying Spaten on Budlight
 budlight_h, budlight_w = budlight_downsampled.shape[:2]
 spaten_h, spaten_w = spaten_digital_logo.shape[:2]
@@ -927,7 +991,12 @@ print(f"Overlay position: ({center_x}, {center_y})")
 print(f"Spaten logo will extend beyond Budlight bounds: {spaten_resized_w > budlight_w or spaten_resized_h > budlight_h}")
 
 # Create the overlay with the resized Spaten logo
-overlay_result = overlay_with_transparency(budlight_downsampled, spaten_resized, center_x, center_y)
+if is_transparent:
+    # Use alpha compositing for transparent logo
+    overlay_result = overlay_with_transparency(budlight_downsampled, spaten_resized, center_x, center_y)
+else:
+    # For non-transparent logo, use simple overlay (no alpha channel)
+    overlay_result = overlay_without_transparency(budlight_downsampled, spaten_resized, center_x, center_y)
 
 # %%
 # Display the final result
@@ -964,7 +1033,12 @@ extended_background[budlight_offset_y:budlight_offset_y + budlight_h,
 # Overlay resized Spaten in the center of extended background
 spaten_offset_x = (extended_w - spaten_resized_w) // 2
 spaten_offset_y = (extended_h - spaten_resized_h) // 2
-extended_overlay = overlay_with_transparency(extended_background, spaten_resized, spaten_offset_x, spaten_offset_y)
+
+# Use the correct overlay function based on transparency
+if is_transparent:
+    extended_overlay = overlay_with_transparency(extended_background, spaten_resized, spaten_offset_x, spaten_offset_y)
+else:
+    extended_overlay = overlay_without_transparency(extended_background, spaten_resized, spaten_offset_x, spaten_offset_y)
 
 plt.imshow(extended_overlay)
 plt.title("Full Overlay (showing extending parts)")
@@ -978,6 +1052,7 @@ print(f"Final overlay shape: {overlay_result.shape}")
 print(f"Extended overlay shape: {extended_overlay.shape}")
 print(f"Spaten was resized from {spaten_w}x{spaten_h} to {spaten_resized_w}x{spaten_resized_h}")
 print(f"Scale factor applied: {scale_factor:.4f}")
+print(f"Transparency mode: {'Transparent' if is_transparent else 'Non-transparent (floor color)'}")
 
 # %% [markdown]
 
@@ -991,6 +1066,14 @@ import os
 # Create directory for saving overlay components
 overlay_dir = "overlay_components"
 os.makedirs(overlay_dir, exist_ok=True)
+
+# Determine filename based on transparency flag
+if is_transparent:
+    components_filename = "overlay_components_transparent.pkl"
+    image_suffix = "_transparent"
+else:
+    components_filename = "overlay_components_not_transparent.pkl"
+    image_suffix = "_not_transparent"
 
 # Save the key components needed for logo replacement
 overlay_components = {
@@ -1011,25 +1094,37 @@ overlay_components = {
 
     # Scale information
     "scale_factor": scale_factor,
-    "target_scale": target_scale
+    "target_scale": target_scale,
+
+    # Transparency information
+    "is_transparent": is_transparent
 }
 
 # Save to file
-with open(os.path.join(overlay_dir, "overlay_components.pkl"), "wb") as f:
+with open(os.path.join(overlay_dir, components_filename), "wb") as f:
     pickle.dump(overlay_components, f)
 
 # Save individual images as well
-cv2.imwrite(os.path.join(overlay_dir, "budlight_downsampled.png"),
+cv2.imwrite(os.path.join(overlay_dir, f"budlight_downsampled{image_suffix}.png"),
             cv2.cvtColor(budlight_downsampled, cv2.COLOR_RGB2BGR))
-cv2.imwrite(os.path.join(overlay_dir, "spaten_resized.png"),
-            cv2.cvtColor(spaten_resized[:,:,:3], cv2.COLOR_RGB2BGR))  # Remove alpha for saving
-cv2.imwrite(os.path.join(overlay_dir, "overlay_result.png"),
+
+if is_transparent:
+    # Save with alpha channel preserved
+    cv2.imwrite(os.path.join(overlay_dir, f"spaten_resized{image_suffix}.png"),
+                cv2.cvtColor(spaten_resized, cv2.COLOR_RGBA2BGRA))
+else:
+    # Save without alpha channel
+    cv2.imwrite(os.path.join(overlay_dir, f"spaten_resized{image_suffix}.png"),
+                cv2.cvtColor(spaten_resized, cv2.COLOR_RGB2BGR))
+
+cv2.imwrite(os.path.join(overlay_dir, f"overlay_result{image_suffix}.png"),
             cv2.cvtColor(overlay_result, cv2.COLOR_RGB2BGR))
 
-print("Overlay components saved successfully!")
+print(f"Overlay components saved successfully as: {components_filename}")
 print(f"Budlight reference logo shape: {budlight_downsampled.shape}")
 print(f"SPATEN replacement logo shape: {spaten_resized.shape}")
 print(f"Overlay offset: ({center_x}, {center_y})")
+print(f"Transparency mode: {'Transparent' if is_transparent else 'Non-transparent (floor color)'}")
 
 # %%
 def map_budlight_to_spaten_coordinates(budlight_points: np.ndarray,
@@ -1129,15 +1224,36 @@ def create_logo_replacement_pipeline():
 
         # Step 5: Warp SPATEN logo to match physical logo perspective
         crop_h, crop_w = physical_logo_cropped.shape[:2]
-        spaten_warped = cv2.warpPerspective(
-            spaten_resized[:,:,:3],  # Remove alpha channel for warping
-            H_spaten,
-            (crop_w, crop_h)
-        )
+
+        if is_transparent:
+            # For transparent logo, remove alpha channel for warping
+            spaten_warped = cv2.warpPerspective(
+                spaten_resized[:,:,:3],  # Remove alpha channel for warping
+                H_spaten,
+                (crop_w, crop_h)
+            )
+        else:
+            # For non-transparent logo, use all channels
+            spaten_warped = cv2.warpPerspective(
+                spaten_resized,
+                H_spaten,
+                (crop_w, crop_h)
+            )
 
         # Step 6: Create mask and replace logo in video frame
-        spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
-        mask = spaten_gray > 0
+        if is_transparent:
+            # For transparent logo, use alpha channel for masking
+            spaten_alpha_warped = cv2.warpPerspective(
+                spaten_resized[:,:,3],  # Alpha channel only
+                H_spaten,
+                (crop_w, crop_h)
+            )
+            mask = spaten_alpha_warped > 0
+        else:
+            # For non-transparent logo, use grayscale intensity for masking
+            spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
+            mask = spaten_gray > 0
+
         mask_3d = np.stack([mask, mask, mask], axis=-1)
 
         # Replace the logo in the video frame
@@ -1151,7 +1267,8 @@ def create_logo_replacement_pipeline():
         "spaten_replacement": spaten_resized,
         "overlay_offset": (center_x, center_y),
         "mapping_function": map_budlight_to_spaten_coordinates,
-        "replacement_pipeline": replace_logo_in_frame
+        "replacement_pipeline": replace_logo_in_frame,
+        "is_transparent": is_transparent
     }
 
 # Create the complete pipeline

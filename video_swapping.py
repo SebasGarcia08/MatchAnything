@@ -29,7 +29,16 @@ from imcui.ui.utils import (
 )
 
 # Load overlay components
-overlay_components_path = Path(__file__).parent / "overlay_components" / "overlay_components.pkl"
+# Configuration for transparency
+is_transparent = False  # Set to True for transparent SPATEN logo, False for floor color
+
+# Determine filename based on transparency flag
+if is_transparent:
+    components_filename = "overlay_components_transparent.pkl"
+else:
+    components_filename = "overlay_components_not_transparent.pkl"
+
+overlay_components_path = Path(__file__).parent / "overlay_components" / components_filename
 print(f"Loading overlay components from: {overlay_components_path}")
 
 with open(overlay_components_path, "rb") as f:
@@ -40,11 +49,21 @@ budlight_downsampled = overlay_components["budlight_downsampled"]
 spaten_resized = overlay_components["spaten_resized"]
 center_x = overlay_components["center_x"]
 center_y = overlay_components["center_y"]
+loaded_is_transparent = overlay_components.get("is_transparent", False)
 
 print(f"Loaded overlay components:")
 print(f"  - Budlight reference: {budlight_downsampled.shape}")
 print(f"  - Spaten replacement: {spaten_resized.shape}")
 print(f"  - Overlay offset: ({center_x}, {center_y})")
+print(f"  - Transparency mode: {'Transparent' if loaded_is_transparent else 'Non-transparent (floor color)'}")
+
+# Verify configuration matches loaded components
+if is_transparent != loaded_is_transparent:
+    print(f"WARNING: Configuration mismatch!")
+    print(f"  Script is_transparent: {is_transparent}")
+    print(f"  Loaded is_transparent: {loaded_is_transparent}")
+    print(f"  Using loaded configuration: {loaded_is_transparent}")
+    is_transparent = loaded_is_transparent
 
 
 # Raw match prediction
@@ -491,15 +510,36 @@ def create_logo_replacement_pipeline():
 
         # Step 5: Warp SPATEN logo to match physical logo perspective
         crop_h, crop_w = physical_logo_cropped.shape[:2]
-        spaten_warped = cv2.warpPerspective(
-            spaten_resized[:,:,:3],  # Remove alpha channel for warping
-            H_spaten,
-            (crop_w, crop_h)
-        )
+
+        if is_transparent:
+            # For transparent logo, remove alpha channel for warping
+            spaten_warped = cv2.warpPerspective(
+                spaten_resized[:,:,:3],  # Remove alpha channel for warping
+                H_spaten,
+                (crop_w, crop_h)
+            )
+        else:
+            # For non-transparent logo, use all channels
+            spaten_warped = cv2.warpPerspective(
+                spaten_resized,
+                H_spaten,
+                (crop_w, crop_h)
+            )
 
         # Step 6: Create mask and replace logo in video frame
-        spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
-        mask = spaten_gray > 0
+        if is_transparent:
+            # For transparent logo, use alpha channel for masking
+            spaten_alpha_warped = cv2.warpPerspective(
+                spaten_resized[:,:,3],  # Alpha channel only
+                H_spaten,
+                (crop_w, crop_h)
+            )
+            mask = spaten_alpha_warped > 0
+        else:
+            # For non-transparent logo, use grayscale intensity for masking
+            spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
+            mask = spaten_gray > 0
+
         mask_3d = np.stack([mask, mask, mask], axis=-1)
 
         # Replace the logo in the video frame
@@ -513,7 +553,8 @@ def create_logo_replacement_pipeline():
         "spaten_replacement": spaten_resized,
         "overlay_offset": (center_x, center_y),
         "mapping_function": map_budlight_to_spaten_coordinates,
-        "replacement_pipeline": replace_logo_in_frame
+        "replacement_pipeline": replace_logo_in_frame,
+        "is_transparent": is_transparent
     }
 
 # Load models once (this should be done at startup)
@@ -569,19 +610,19 @@ while video_stream.isOpened():
     if end_frame is not None and current_frame_number >= end_frame:
         print(f"Reached end timestamp at frame {current_frame_number}")
         break
-    
+
     # Detect Budlight logo
     results = det_model_budlight(frame)
     boxes = results[0].boxes.xyxy
-    
+
     # Convert BGR to RGB for processing
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result_frame = frame_rgb.copy()
-    
+
     if boxes.shape[0] > 0:
         budlight_bbox = boxes.cpu().numpy().astype("int").squeeze()
         print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
-        
+
         try:
             # Apply logo replacement pipeline
             result_frame = logo_replacement_pipeline["replacement_pipeline"](
@@ -597,28 +638,28 @@ while video_stream.isOpened():
             result_frame = frame_rgb  # Use original frame if replacement fails
     else:
         print(f"Frame {current_frame_number}: No Budlight logo detected")
-    
+
     # Display both frames side by side
     ax1.clear()
     ax1.imshow(frame_rgb)
     ax1.set_title(f'Original Frame {current_frame_number}')
     ax1.axis('off')
-    
+
     ax2.clear()
     ax2.imshow(result_frame)
     ax2.set_title(f'Logo Replacement Result {current_frame_number}')
     ax2.axis('off')
-    
+
     plt.draw()
     plt.pause(0.001)  # Small pause to allow matplotlib to update
-    
+
     # Performance metrics
     frame_time = time.time() - start_time_frame
     fps = 1.0 / frame_time if frame_time > 0 else 0
     print(f"Frame {current_frame_number}: Processing time: {frame_time:.3f}s, FPS: {fps:.1f}")
-    
+
     current_frame_number += 1
-    
+
     # Optional: Add a small delay to control playback speed
     # time.sleep(1/video_fps)  # Uncomment to play at original speed
 
