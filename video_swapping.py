@@ -4,6 +4,7 @@ from swappr.utils import parse_timestamp_to_frame
 import matplotlib.pyplot as plt
 import numpy as np
 from ultralytics import YOLO
+from ultralytics.engine.results import Results
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -560,8 +561,12 @@ def create_logo_replacement_pipeline():
 # Load models once (this should be done at startup)
 print("Loading MatchAnything models...")
 
-# eloftr_model, eloftr_preprocessing_conf = load_matchanything_model("matchanything_eloftr", log_timing=True)
-roma_model, roma_preprocessing_conf = load_matchanything_model("matchanything_roma", log_timing=True)
+model_type = "roma"
+
+if model_type == "roma":
+	model, preprocessing_conf = load_matchanything_model("matchanything_roma", log_timing=True)
+else:
+	model, preprocessing_conf = load_matchanything_model("matchanything_eloftr", log_timing=True)
 
 # Create the complete pipeline
 logo_replacement_pipeline = create_logo_replacement_pipeline()
@@ -570,12 +575,19 @@ print("Logo replacement pipeline created successfully!")
 
 # Video processing parameters
 video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEncode_swappr_317.ts"
+
 # 01:26:05-01:26:17
 # 01:53:12-01:53:15
 # 00:50:42-00:50:48
 start_timestamp = "00:50:42" # 00:36:37
 end_timestamp = "00:50:48"
+
+start_timestamp = "01:55:36"
+end_timestamp="01:55:50"
+
+output_video_path = f"swapped_{model_type}_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
+tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
 
 det_model_budlight = YOLO(yolo_model_path)
 video_stream = cv2.VideoCapture(video_path)
@@ -586,6 +598,18 @@ end_frame = parse_timestamp_to_frame(end_timestamp, video_fps)
 
 video_stream.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 current_frame_number = start_frame
+
+# Get video properties for output
+frame_width: int = int(video_stream.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height: int = int(video_stream.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Create VideoWriter object
+out = cv2.VideoWriter(
+    output_video_path,
+    cv2.VideoWriter_fourcc(*'mp4v'),
+    video_fps,
+    (frame_width, frame_height)
+)
 
 # Set up matplotlib for displaying frames
 plt.ion()  # Turn on interactive mode
@@ -612,7 +636,12 @@ while video_stream.isOpened():
         break
 
     # Detect Budlight logo
-    results = det_model_budlight(frame)
+    results: list[Results] = det_model_budlight.track(
+		frame, conf=0.8,
+		persist=True, # because we're inferencing in batches
+		tracker=tracker_config_path, stream=False,
+		verbose=False,
+	)
     boxes = results[0].boxes.xyxy
 
     # Convert BGR to RGB for processing
@@ -628,8 +657,8 @@ while video_stream.isOpened():
             result_frame = logo_replacement_pipeline["replacement_pipeline"](
                 frame_rgb,
                 budlight_bbox,
-                roma_model,
-                roma_preprocessing_conf,
+                model,
+                preprocessing_conf,
                 expansion_factor=0.1
             )
             print(f"Frame {current_frame_number}: Logo replacement applied successfully")
@@ -638,6 +667,10 @@ while video_stream.isOpened():
             result_frame = frame_rgb  # Use original frame if replacement fails
     else:
         print(f"Frame {current_frame_number}: No Budlight logo detected")
+
+    # Convert result frame back to BGR for video writing
+    result_frame_bgr = cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR)
+    out.write(result_frame_bgr)
 
     # Display both frames side by side
     ax1.clear()
@@ -660,10 +693,8 @@ while video_stream.isOpened():
 
     current_frame_number += 1
 
-    # Optional: Add a small delay to control playback speed
-    # time.sleep(1/video_fps)  # Uncomment to play at original speed
-
 video_stream.release()
+out.release()
 plt.ioff()  # Turn off interactive mode
 plt.show()
 
