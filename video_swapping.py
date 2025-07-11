@@ -493,12 +493,17 @@ def create_logo_replacement_pipeline():
         spaten_keypoints = map_budlight_to_spaten_coordinates(budlight_keypoints, center_x, center_y)
 
         # Step 4: Compute homography using physical logo keypoints -> SPATEN keypoints
-        physical_keypoints = match_filtered['mmkpts0']  # Keypoints in physical logo
+        physical_keypoints = match_filtered['mmkpts0']  # Keypoints in physical logo (cropped space)
 
-        # Compute homography: physical logo -> SPATEN
+        # ✅ NEW: Transform physical keypoints to full frame coordinates
+        physical_keypoints_full_frame = physical_keypoints.copy()
+        physical_keypoints_full_frame[:, 0] += x1  # Add x offset
+        physical_keypoints_full_frame[:, 1] += y1  # Add y offset
+
+        # Compute homography: SPATEN -> full frame coordinates
         H_spaten, mask = cv2.findHomography(
             spaten_keypoints,  # Source: SPATEN coordinates
-            physical_keypoints,  # Target: physical logo coordinates
+            physical_keypoints_full_frame,  # Target: full frame coordinates
             cv2.RANSAC,
             ransacReprojThreshold=8.0,
             confidence=0.999,
@@ -509,31 +514,31 @@ def create_logo_replacement_pipeline():
             print("Failed to compute SPATEN homography, returning original frame")
             return video_frame
 
-        # Step 5: Warp SPATEN logo to match physical logo perspective
-        crop_h, crop_w = physical_logo_cropped.shape[:2]
+        # Step 5: Warp SPATEN logo to full frame size
+        frame_h, frame_w = video_frame.shape[:2]
 
         if is_transparent:
             # For transparent logo, remove alpha channel for warping
             spaten_warped = cv2.warpPerspective(
                 spaten_resized[:,:,:3],  # Remove alpha channel for warping
                 H_spaten,
-                (crop_w, crop_h)
+                (frame_w, frame_h)  # ✅ NEW: Warp to full frame size
             )
         else:
             # For non-transparent logo, use all channels
             spaten_warped = cv2.warpPerspective(
                 spaten_resized,
                 H_spaten,
-                (crop_w, crop_h)
+                (frame_w, frame_h)  # ✅ NEW: Warp to full frame size
             )
 
-        # Step 6: Create mask and replace logo in video frame
+        # Step 6: Create mask for entire frame and replace logo
         if is_transparent:
             # For transparent logo, use alpha channel for masking
             spaten_alpha_warped = cv2.warpPerspective(
                 spaten_resized[:,:,3],  # Alpha channel only
                 H_spaten,
-                (crop_w, crop_h)
+                (frame_w, frame_h)  # ✅ NEW: Warp alpha to full frame size
             )
             mask = spaten_alpha_warped > 0
         else:
@@ -543,9 +548,9 @@ def create_logo_replacement_pipeline():
 
         mask_3d = np.stack([mask, mask, mask], axis=-1)
 
-        # Replace the logo in the video frame
+        # ✅ NEW: Replace logo in entire frame (not just bounding box)
         result_frame = video_frame.copy()
-        result_frame[y1:y2, x1:x2][mask_3d] = spaten_warped[mask_3d]
+        result_frame[mask_3d] = spaten_warped[mask_3d]
 
         return result_frame
 
@@ -581,9 +586,9 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 # 00:50:42-00:50:48
 start_timestamp = "00:50:42" # 00:36:37
 end_timestamp = "00:50:48"
-
-start_timestamp = "01:55:36"
-end_timestamp="01:55:50"
+# 00:50:42_00:50:48
+start_timestamp = "00:35:49"
+end_timestamp="00:36:00"
 
 output_video_path = f"swapped_{model_type}_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
