@@ -32,701 +32,11 @@ from imcui.ui.utils import (
     DEFAULT_MIN_NUM_MATCHES, ransac_zoo, DEFAULT_RANSAC_METHOD
 )
 
-# Hybrid tracking configuration
-MATCH_EVERY_N_FRAMES = 320
-MAX_KP_TO_TRACK = 200  # Reduced from 400 for better stability
-MIN_KP_FOR_HOMOGRAPHY = 40  # Reduced from 100 for more flexibility
-ROMA_CONFIDENCE_THRESHOLD = 0.05  # Increased from 0.02
-COTRACKER_INPUT_RESOLUTION = (384, 512)  # H, W for CoTracker3
-
-# Memory optimization settings
-USE_MIXED_PRECISION = True  # Enable half precision for memory savings
-REDUCE_FRAME_BUFFER_SIZE = True  # Use minimal frame buffer
-COTRACKER_FRAME_BUFFER_SIZE = 16  # Reduced from 32 (model.step * 2)
-PROCESS_RESOLUTION_SCALE = 0.8  # Process at 80% resolution to save memory
-UNLOAD_MODELS_BETWEEN_FRAMES = False  # Extreme memory saving (slower)
-ENABLE_MEMORY_MONITORING = True  # Monitor GPU memory usage
-COTRACKER_MIXED_PRECISION = False  # Disable mixed precision for CoTracker3 (compatibility issue)
-
-# Stability optimization settings
-ENABLE_TEMPORAL_SMOOTHING = True  # Enable homography smoothing
-HOMOGRAPHY_SMOOTHING_ALPHA = 0.7  # Smoothing factor (0.0 = no smoothing, 1.0 = full smoothing)
-KEYPOINT_QUALITY_THRESHOLD = 0.05  # Filter out low-quality keypoints
-HOMOGRAPHY_VALIDATION_THRESHOLD = 0.3  # Validate homography stability
-MAX_HOMOGRAPHY_CHANGE = 0.3  # Maximum allowed homography change between frames
-
-# Global variables for tracking state
-cotracker_model = None
-cotracker_initialized = False
-cotracker_queries = None
-frame_buffer = []
-current_keypoints = None
-reference_keypoints = None
-frame_counter = 0
-
-# Temporal smoothing variables
-previous_homography = None
-homography_history = []
-MAX_HISTORY_SIZE = 10
-
-def get_gpu_memory_usage():
-    """Get current GPU memory usage in MB."""
-    if torch.cuda.is_available():
-        return torch.cuda.memory_allocated() / (1024**2)
-    return 0
-
-def log_memory_usage(stage: str):
-    """Log GPU memory usage at different stages."""
-    if ENABLE_MEMORY_MONITORING and torch.cuda.is_available():
-        memory_mb = get_gpu_memory_usage()
-        print(f"GPU Memory [{stage}]: {memory_mb:.1f} MB")
-
-def clear_gpu_memory():
-    """Clear GPU memory and run garbage collection."""
-    import gc
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    gc.collect()
-
-def unload_cotracker_model():
-    """Unload CoTracker model to free memory (extreme memory saving)."""
-    global cotracker_model, cotracker_initialized
-    if cotracker_model is not None:
-        del cotracker_model
-        cotracker_model = None
-        cotracker_initialized = False
-        clear_gpu_memory()
-        print("CoTracker model unloaded to save memory")
-
-def initialize_cotracker():
-    """Initialize CoTracker3 online model with memory optimizations."""
-    global cotracker_model
-    if cotracker_model is None:
-        log_memory_usage("Before CoTracker loading")
-        print("Loading CoTracker3 online model with memory optimizations...")
-        with torch.inference_mode():  # Memory optimization
-            cotracker_model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            cotracker_model = cotracker_model.to(device)
-
-            # Note: CoTracker3 kept in full precision due to compatibility issues
-            # Mixed precision disabled for CoTracker3 to avoid dtype mismatches
-            if not COTRACKER_MIXED_PRECISION:
-                print("CoTracker3 kept in full precision for stability")
-
-        print(f"CoTracker3 online model loaded successfully! Step size: {cotracker_model.step}")
-        clear_gpu_memory()  # Clear memory after loading
-        log_memory_usage("After CoTracker loading")
-
-def detect_keypoints_with_roma(frame: np.ndarray,
-                              logo_bbox: np.ndarray,
-                              roma_model,
-                              preprocessing_conf: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Detect keypoints using MatchAnything ROMA model with memory optimizations and quality filtering.
-
-    Args:
-        frame: Current frame
-        logo_bbox: Logo bounding box [x1, y1, x2, y2]
-        roma_model: ROMA model
-        preprocessing_conf: Preprocessing configuration
-
-    Returns:
-        Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
-    """
-    # Memory optimization: Use inference mode for all operations
-    with torch.inference_mode():
-        log_memory_usage("Before ROMA processing")
-
-        # Expand bounding box
-        img_height, img_width = frame.shape[:2]
-        x1, y1, x2, y2 = expand_box(logo_bbox, 0.1, img_width, img_height)
-
-        # Crop logo region
-        physical_logo_cropped = frame[y1:y2, x1:x2]
-
-        # Memory optimization: Reduce processing resolution if needed
-        if PROCESS_RESOLUTION_SCALE < 1.0:
-            new_h = int(physical_logo_cropped.shape[0] * PROCESS_RESOLUTION_SCALE)
-            new_w = int(physical_logo_cropped.shape[1] * PROCESS_RESOLUTION_SCALE)
-            physical_logo_cropped = cv2.resize(physical_logo_cropped, (new_w, new_h))
-            # Scale coordinates back later
-            scale_factor = 1.0 / PROCESS_RESOLUTION_SCALE
-        else:
-            scale_factor = 1.0
-
-        # Run ROMA matching with more keypoints initially for better filtering
-        match_pred = run_matching_simple(
-            roma_model,
-            physical_logo_cropped,
-            budlight_downsampled,
-            preprocessing_conf=preprocessing_conf,
-            match_threshold=ROMA_CONFIDENCE_THRESHOLD,
-            extract_max_keypoints=MAX_KP_TO_TRACK * 3,  # Get 3x more for quality filtering
-            log_timing=False
-        )
-
-        # Filter matches with RANSAC
-        match_filtered = filter_matches_ransac(match_pred, log_timing=False)
-
-        if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
-            print(f"ROMA: Insufficient matches ({len(match_filtered.get('mmkpts0', []))}) for reliable tracking")
-            return None, None
-
-        # Get keypoints in cropped coordinates
-        frame_keypoints_cropped = match_filtered['mmkpts0']  # [N, 2]
-        reference_keypoints = match_filtered['mmkpts1']  # [N, 2]
-        confidences = match_filtered['mmconf']  # [N]
-
-        # Apply quality filtering based on confidence scores
-        frame_keypoints_quality, reference_keypoints_quality = filter_keypoints_by_quality(
-            frame_keypoints_cropped, reference_keypoints, confidences
-        )
-
-        # Check if we have enough high-quality keypoints
-        if len(frame_keypoints_quality) < MIN_KP_FOR_HOMOGRAPHY:
-            print(f"ROMA: Insufficient high-quality keypoints ({len(frame_keypoints_quality)}) after quality filtering")
-            return None, None
-
-        # Scale keypoints back if resolution was reduced
-        if scale_factor != 1.0:
-            frame_keypoints_quality = frame_keypoints_quality * scale_factor
-
-        # Convert to full frame coordinates
-        frame_keypoints_full = frame_keypoints_quality.copy()
-        frame_keypoints_full[:, 0] += x1  # Add x offset
-        frame_keypoints_full[:, 1] += y1  # Add y offset
-
-        # Ensure spatial distribution of keypoints for better stability
-        frame_keypoints_distributed, reference_keypoints_distributed = ensure_spatial_distribution(
-            frame_keypoints_full, reference_keypoints_quality
-        )
-
-        print(f"ROMA: Detected {len(frame_keypoints_distributed)} high-quality, well-distributed keypoints")
-
-        # Memory cleanup
-        del match_pred, match_filtered, physical_logo_cropped
-        clear_gpu_memory()
-        log_memory_usage("After ROMA processing")
-
-        return frame_keypoints_distributed, reference_keypoints_distributed
-
-def ensure_spatial_distribution(keypoints: np.ndarray,
-                               reference_keypoints: np.ndarray,
-                               grid_size: int = 4) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Ensure keypoints are spatially distributed across the logo region for stable homography.
-
-    Args:
-        keypoints: Frame keypoints [N, 2]
-        reference_keypoints: Reference keypoints [N, 2]
-        grid_size: Number of grid cells per dimension
-
-    Returns:
-        Tuple of (distributed_keypoints, distributed_reference_keypoints)
-    """
-    if len(keypoints) <= MAX_KP_TO_TRACK:
-        return keypoints, reference_keypoints
-
-    # Calculate bounding box of keypoints
-    min_x, min_y = np.min(keypoints, axis=0)
-    max_x, max_y = np.max(keypoints, axis=0)
-
-    # Create grid
-    grid_width = (max_x - min_x) / grid_size
-    grid_height = (max_y - min_y) / grid_size
-
-    if grid_width == 0 or grid_height == 0:
-        return keypoints[:MAX_KP_TO_TRACK], reference_keypoints[:MAX_KP_TO_TRACK]
-
-    # Select keypoints from each grid cell
-    selected_indices = []
-    keypoints_per_cell = max(1, MAX_KP_TO_TRACK // (grid_size * grid_size))
-
-    for i in range(grid_size):
-        for j in range(grid_size):
-            # Define grid cell boundaries
-            cell_min_x = min_x + i * grid_width
-            cell_max_x = min_x + (i + 1) * grid_width
-            cell_min_y = min_y + j * grid_height
-            cell_max_y = min_y + (j + 1) * grid_height
-
-            # Find keypoints in this cell
-            in_cell = ((keypoints[:, 0] >= cell_min_x) & (keypoints[:, 0] < cell_max_x) &
-                      (keypoints[:, 1] >= cell_min_y) & (keypoints[:, 1] < cell_max_y))
-
-            cell_indices = np.where(in_cell)[0]
-
-            # Select best keypoints from this cell
-            if len(cell_indices) > 0:
-                # Take first keypoints_per_cell keypoints (they're already sorted by quality)
-                selected_indices.extend(cell_indices[:keypoints_per_cell])
-
-    # If we don't have enough keypoints, add the remaining best ones
-    if len(selected_indices) < MAX_KP_TO_TRACK:
-        remaining_indices = [i for i in range(len(keypoints)) if i not in selected_indices]
-        needed = MAX_KP_TO_TRACK - len(selected_indices)
-        selected_indices.extend(remaining_indices[:needed])
-
-    selected_indices = selected_indices[:MAX_KP_TO_TRACK]
-
-    if len(selected_indices) == 0:
-        return keypoints[:MAX_KP_TO_TRACK], reference_keypoints[:MAX_KP_TO_TRACK]
-
-    distributed_keypoints = keypoints[selected_indices]
-    distributed_reference_keypoints = reference_keypoints[selected_indices]
-
-    print(f"Spatial distribution: {len(distributed_keypoints)} keypoints selected from {grid_size}x{grid_size} grid")
-    return distributed_keypoints, distributed_reference_keypoints
-
-def initialize_cotracker_online(initial_frame: np.ndarray,
-                               initial_keypoints: np.ndarray) -> bool:
-    """
-    Initialize CoTracker3 online processing with memory optimizations.
-
-    Args:
-        initial_frame: Initial frame for CoTracker3
-        initial_keypoints: Initial keypoints [N, 2] in full frame coordinates
-
-    Returns:
-        True if initialization successful, False otherwise
-    """
-    global cotracker_initialized, cotracker_queries, frame_buffer
-
-    # Memory optimization: Use inference mode
-    with torch.inference_mode():
-        # Ensure CoTracker model is loaded
-        initialize_cotracker()
-
-        if cotracker_model is None:
-            return False
-
-        # Prepare frame tensor - CoTracker3 online expects [B, T, C, H, W]
-        frame_resized = cv2.resize(initial_frame, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
-        frame_tensor = torch.from_numpy(frame_resized).float()
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        frame_tensor = frame_tensor.to(device)
-
-        # Keep in full precision for CoTracker3 compatibility
-        frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-
-        # Scale keypoints to CoTracker resolution
-        frame_height, frame_width = initial_frame.shape[:2]
-        scaled_keypoints = initial_keypoints.copy()
-        scaled_keypoints[:, 0] *= COTRACKER_INPUT_RESOLUTION[1] / frame_width   # Scale x
-        scaled_keypoints[:, 1] *= COTRACKER_INPUT_RESOLUTION[0] / frame_height  # Scale y
-
-        # Prepare queries tensor: [1, N, 3] where each point is [t, x, y]
-        num_points = len(scaled_keypoints)
-        queries = torch.zeros(1, num_points, 3).to(device)
-
-        # Keep in full precision for CoTracker3 compatibility
-        queries[0, :, 0] = 0  # Time index (first frame)
-        queries[0, :, 1] = torch.from_numpy(scaled_keypoints[:, 0]).float().to(device)
-        queries[0, :, 2] = torch.from_numpy(scaled_keypoints[:, 1]).float().to(device)
-
-        # Store queries for later use
-        cotracker_queries = queries
-
-        # Initialize CoTracker3 online processing
-        cotracker_model(
-            video_chunk=frame_tensor,
-            is_first_step=True,
-            grid_size=0,
-            queries=queries,
-            add_support_grid=False
-        )
-
-        # Memory optimization: Use smaller frame buffer
-        buffer_size = COTRACKER_FRAME_BUFFER_SIZE if REDUCE_FRAME_BUFFER_SIZE else (cotracker_model.step * 2)
-        frame_buffer = [initial_frame] * buffer_size
-
-        cotracker_initialized = True
-        print(f"CoTracker3 online initialized with {num_points} keypoints (buffer size: {buffer_size})")
-
-        # Memory cleanup
-        del frame_tensor, queries
-        clear_gpu_memory()
-
-        return True
-
-def track_keypoints_with_cotracker(frame: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Track keypoints using CoTracker3 online model with memory optimizations.
-
-    Args:
-        frame: Current frame
-
-    Returns:
-        Tracked keypoints [N, 2] in full frame coordinates or None if failed
-    """
-    global frame_buffer, cotracker_queries
-
-    if not cotracker_initialized or cotracker_queries is None or cotracker_model is None:
-        return None
-
-    # Memory optimization: Use inference mode
-    with torch.inference_mode():
-        # Add new frame to buffer and remove oldest
-        frame_buffer.append(frame)
-
-        # Memory optimization: Keep smaller buffer size
-        buffer_size = COTRACKER_FRAME_BUFFER_SIZE if REDUCE_FRAME_BUFFER_SIZE else (cotracker_model.step * 2)
-        frame_buffer = frame_buffer[-buffer_size:]
-
-        # Prepare video chunk - use available frames
-        video_chunk_frames = frame_buffer[-min(len(frame_buffer), cotracker_model.step * 2):]
-
-        # Resize frames to CoTracker resolution
-        video_chunk_resized = []
-        for frame_i in video_chunk_frames:
-            frame_resized = cv2.resize(frame_i, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
-            video_chunk_resized.append(frame_resized)
-
-        # Convert to tensor [1, T, C, H, W]
-        video_chunk_tensor = torch.from_numpy(np.stack(video_chunk_resized)).float()
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        video_chunk_tensor = video_chunk_tensor.to(device)
-
-        # Keep in full precision for CoTracker3 compatibility
-        video_chunk_tensor = video_chunk_tensor.permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, 3, H, W]
-
-        # Run CoTracker3 online inference
-        pred_tracks, pred_visibility = cotracker_model(
-            video_chunk=video_chunk_tensor,
-            is_first_step=False,
-            grid_size=0,
-            queries=cotracker_queries,
-            add_support_grid=False
-        )
-
-        # Get tracks for the last frame (most recent)
-        last_frame_tracks = pred_tracks[0, -1].cpu().numpy()  # [N, 2]
-        last_frame_visibility = pred_visibility[0, -1].cpu().numpy()  # [N]
-
-        # Scale from CoTracker resolution to full frame resolution
-        frame_height, frame_width = frame.shape[:2]
-        last_frame_tracks[:, 0] *= frame_width / COTRACKER_INPUT_RESOLUTION[1]   # Scale x
-        last_frame_tracks[:, 1] *= frame_height / COTRACKER_INPUT_RESOLUTION[0]  # Scale y
-
-        print(f"CoTracker3: Tracked {len(last_frame_tracks)} keypoints")
-
-        # Memory cleanup
-        del video_chunk_tensor, pred_tracks, pred_visibility
-        clear_gpu_memory()
-
-        return last_frame_tracks
-
-def filter_occluded_keypoints(keypoints: np.ndarray,
-                             person_masks: np.ndarray,
-                             reference_keypoints: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Filter keypoints that are occluded by people, but keep tracking them.
-
-    Args:
-        keypoints: Keypoints [N, 2] in full frame coordinates
-        person_masks: Person segmentation masks [H, W]
-        reference_keypoints: Reference keypoints [N, 2] in logo coordinates
-
-    Returns:
-        Tuple of (visible_keypoints, visible_reference_keypoints) for homography computation
-    """
-    if len(keypoints) == 0 or len(reference_keypoints) == 0:
-        return keypoints, reference_keypoints
-
-    # Handle size mismatch between tracked and reference keypoints
-    min_size = min(len(keypoints), len(reference_keypoints))
-    if len(keypoints) != len(reference_keypoints):
-        print(f"Warning: Keypoint size mismatch - tracked: {len(keypoints)}, reference: {len(reference_keypoints)}")
-        print(f"Using first {min_size} keypoints from both arrays")
-        keypoints = keypoints[:min_size]
-        reference_keypoints = reference_keypoints[:min_size]
-
-    # Check which keypoints are not occluded
-    visible_mask = np.ones(len(keypoints), dtype=bool)
-
-    for i, (x, y) in enumerate(keypoints):
-        # Check if keypoint is within frame bounds
-        if x < 0 or y < 0 or x >= person_masks.shape[1] or y >= person_masks.shape[0]:
-            visible_mask[i] = False
-            continue
-
-        # Check if keypoint is occluded by person
-        if person_masks[int(y), int(x)] > 0:
-            visible_mask[i] = False
-
-    # Filter keypoints for homography computation (only visible ones)
-    visible_keypoints = keypoints[visible_mask]
-    visible_reference_keypoints = reference_keypoints[visible_mask]
-
-    print(f"Occlusion filter: {len(visible_keypoints)}/{len(keypoints)} keypoints visible")
-    return visible_keypoints, visible_reference_keypoints
-
-def get_keypoints_for_frame(frame: np.ndarray,
-                           logo_bbox: np.ndarray,
-                           person_masks: np.ndarray,
-                           roma_model,
-                           preprocessing_conf: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Get keypoints for current frame using hybrid tracking approach.
-
-    Args:
-        frame: Current frame
-        logo_bbox: Logo bounding box [x1, y1, x2, y2]
-        person_masks: Person segmentation masks [H, W]
-        roma_model: ROMA model
-        preprocessing_conf: Preprocessing configuration
-
-    Returns:
-        Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
-    """
-    global frame_counter, current_keypoints, reference_keypoints, cotracker_initialized
-
-    frame_counter += 1
-    is_recalibration_frame = frame_counter % MATCH_EVERY_N_FRAMES == 1
-
-    print(f"Frame {frame_counter}: {'ROMA recalibration' if is_recalibration_frame else 'CoTracker tracking'}")
-
-    if is_recalibration_frame or not cotracker_initialized:
-        # Recalibration phase: Use ROMA to detect keypoints
-        frame_kp, ref_kp = detect_keypoints_with_roma(frame, logo_bbox, roma_model, preprocessing_conf)
-
-        if frame_kp is not None and ref_kp is not None:
-            # Filter occluded keypoints
-            frame_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(frame_kp, person_masks, ref_kp)
-
-            if len(frame_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
-                # Update tracking state - store original unfiltered keypoints
-                current_keypoints = frame_kp.copy()  # Store all keypoints for tracking
-                reference_keypoints = ref_kp.copy()  # Store all reference keypoints
-
-                # Initialize CoTracker3 online for next frames with ALL keypoints
-                initialize_cotracker_online(frame, frame_kp)
-
-                print(f"Frame {frame_counter}: ROMA success with {len(frame_kp_filtered)} visible keypoints")
-                return frame_kp_filtered, ref_kp_filtered
-            else:
-                print(f"Frame {frame_counter}: Insufficient visible keypoints after filtering ({len(frame_kp_filtered)})")
-                return None, None
-        else:
-            print(f"Frame {frame_counter}: ROMA detection failed")
-            return None, None
-
-    else:
-        # Tracking phase: Use CoTracker3 online to track existing keypoints
-        tracked_kp = track_keypoints_with_cotracker(frame)
-
-        if tracked_kp is not None and reference_keypoints is not None:
-            # Make sure we have consistent sizes for filtering
-            # Use the originPrimero usá estal reference_keypoints (not modified by previous filtering)
-            ref_kp_for_filtering = reference_keypoints.copy()
-
-            # Filter occluded keypoints for homography computation
-            tracked_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(tracked_kp, person_masks, ref_kp_for_filtering)
-
-            if len(tracked_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
-                print(f"Frame {frame_counter}: CoTracker success with {len(tracked_kp_filtered)} visible keypoints")
-                return tracked_kp_filtered, ref_kp_filtered
-            else:
-                print(f"Frame {frame_counter}: Insufficient visible keypoints after tracking ({len(tracked_kp_filtered)})")
-                # Reset for immediate recalibration
-                cotracker_initialized = False
-                frame_counter = MATCH_EVERY_N_FRAMES  # Force recalibration
-                return None, None
-        else:
-            print(f"Frame {frame_counter}: CoTracker tracking failed")
-            # Reset for immediate recalibration
-            cotracker_initialized = False
-            frame_counter = MATCH_EVERY_N_FRAMES  # Force recalibration
-            return None, None
-
-
-def filter_keypoints_by_quality(keypoints: np.ndarray,
-                                reference_keypoints: np.ndarray,
-                                confidences: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Filter keypoints based on quality/confidence scores.
-
-    Args:
-        keypoints: Frame keypoints [N, 2]
-        reference_keypoints: Reference keypoints [N, 2]
-        confidences: Confidence scores [N]
-
-    Returns:
-        Tuple of (filtered_keypoints, filtered_reference_keypoints)
-    """
-    if len(keypoints) == 0 or len(confidences) == 0:
-        return keypoints, reference_keypoints
-
-    # Filter by confidence threshold
-    quality_mask = confidences > KEYPOINT_QUALITY_THRESHOLD
-
-    # Take top keypoints if we have too many
-    if np.sum(quality_mask) > MAX_KP_TO_TRACK:
-        # Sort by confidence and take top MAX_KP_TO_TRACK
-        sorted_indices = np.argsort(confidences)[-MAX_KP_TO_TRACK:]
-        quality_mask = np.zeros(len(keypoints), dtype=bool)
-        quality_mask[sorted_indices] = True
-
-    filtered_keypoints = keypoints[quality_mask]
-    filtered_reference_keypoints = reference_keypoints[quality_mask]
-
-    print(f"Quality filter: {len(filtered_keypoints)}/{len(keypoints)} keypoints kept")
-    return filtered_keypoints, filtered_reference_keypoints
-
-def validate_homography(H: np.ndarray,
-                       frame_keypoints: np.ndarray,
-                       reference_keypoints: np.ndarray) -> bool:
-    """
-    Validate homography matrix for stability and reasonableness.
-
-    Args:
-        H: Homography matrix [3, 3]
-        frame_keypoints: Frame keypoints [N, 2]
-        reference_keypoints: Reference keypoints [N, 2]
-
-    Returns:
-        True if homography is valid, False otherwise
-    """
-    if H is None:
-        return False
-
-    try:
-        # Check if homography is well-conditioned
-        det = np.linalg.det(H[:2, :2])
-        if abs(det) < 1e-6:
-            return False
-
-        # Check for reasonable transformation (not too extreme)
-        # Compute scale and rotation from homography
-        scale_x = np.linalg.norm(H[:2, 0])
-        scale_y = np.linalg.norm(H[:2, 1])
-
-        # Reject if scale is too extreme
-        if scale_x < 0.1 or scale_x > 10.0 or scale_y < 0.1 or scale_y > 10.0:
-            return False
-
-        # Check reprojection error
-        if len(frame_keypoints) >= 4 and len(reference_keypoints) >= 4:
-            # Project reference points using homography
-            ref_homogeneous = np.column_stack([reference_keypoints, np.ones(len(reference_keypoints))])
-            projected = H @ ref_homogeneous.T
-            projected = projected[:2] / projected[2]
-            projected = projected.T
-
-            # Calculate reprojection error
-            errors = np.linalg.norm(projected - frame_keypoints, axis=1)
-            mean_error = np.mean(errors)
-
-            # Reject if mean reprojection error is too high
-            if mean_error > 20.0:  # 20 pixels
-                return False
-
-        return True
-
-    except Exception:
-        return False
-
-def smooth_homography(current_H: np.ndarray) -> np.ndarray:
-    """
-    Apply temporal smoothing to homography matrix.
-
-    Args:
-        current_H: Current homography matrix [3, 3]
-
-    Returns:
-        Smoothed homography matrix [3, 3]
-    """
-    global previous_homography, homography_history
-
-    if not ENABLE_TEMPORAL_SMOOTHING:
-        return current_H
-
-    if current_H is None:
-        return None
-
-    # Add current homography to history
-    homography_history.append(current_H.copy())
-    if len(homography_history) > MAX_HISTORY_SIZE:
-        homography_history.pop(0)
-
-    # Simple temporal smoothing with previous homography
-    if previous_homography is not None:
-        # Check if the change is too dramatic
-        diff = np.linalg.norm(current_H - previous_homography)
-        normalized_diff = diff / np.linalg.norm(previous_homography)
-
-        if normalized_diff > MAX_HOMOGRAPHY_CHANGE:
-            print(f"Large homography change detected ({normalized_diff:.3f}), applying stronger smoothing")
-            # Apply stronger smoothing for large changes
-            smoothed_H = HOMOGRAPHY_SMOOTHING_ALPHA * previous_homography + (1 - HOMOGRAPHY_SMOOTHING_ALPHA) * current_H
-        else:
-            # Normal smoothing
-            smoothed_H = (1 - HOMOGRAPHY_SMOOTHING_ALPHA) * previous_homography + HOMOGRAPHY_SMOOTHING_ALPHA * current_H
-    else:
-        smoothed_H = current_H
-
-    # Update previous homography
-    previous_homography = smoothed_H.copy()
-
-    return smoothed_H
-
-def compute_homography_from_keypoints(frame_keypoints: np.ndarray,
-                                     reference_keypoints: np.ndarray,
-                                     method: int = cv2.RANSAC,
-                                     ransac_threshold: float = 5.0,  # Reduced from 8.0 for better stability
-                                     confidence: float = 0.999,
-                                     max_iters: int = 2000) -> Optional[np.ndarray]:  # Reduced iterations for speed
-    """
-    Compute homography matrix from corresponding keypoints with validation and smoothing.
-
-    Args:
-        frame_keypoints: Keypoints in frame coordinates [N, 2]
-        reference_keypoints: Keypoints in reference logo coordinates [N, 2]
-        method: OpenCV method for homography computation
-        ransac_threshold: RANSAC reprojection threshold
-        confidence: RANSAC confidence level
-        max_iters: Maximum RANSAC iterations
-
-    Returns:
-        Homography matrix [3, 3] or None if computation failed
-    """
-    if len(frame_keypoints) < 4 or len(reference_keypoints) < 4:
-        return None
-
-    try:
-        # Compute homography using all available keypoints
-        H, mask = cv2.findHomography(
-            reference_keypoints,  # Source points (reference logo)
-            frame_keypoints,      # Destination points (frame)
-            method=method,
-            ransacReprojThreshold=ransac_threshold,
-            confidence=confidence,
-            maxIters=max_iters
-        )
-
-        # Validate homography
-        if not validate_homography(H, frame_keypoints, reference_keypoints):
-            print("Homography validation failed")
-            return None
-
-        # Apply temporal smoothing
-        H_smoothed = smooth_homography(H)
-
-        # Final validation after smoothing
-        if not validate_homography(H_smoothed, frame_keypoints, reference_keypoints):
-            print("Smoothed homography validation failed, using unsmoothed version")
-            return H
-
-        return H_smoothed
-
-    except Exception as e:
-        print(f"Homography computation failed: {e}")
-        return None
-
+# Simple configuration for frame-by-frame processing
+ROMA_CONFIDENCE_THRESHOLD = 0.05
+MAX_KEYPOINTS = 2000
+MIN_KP_FOR_HOMOGRAPHY = 20
+RANSAC_THRESHOLD = 5.0
 
 # Load overlay components
 # Configuration for transparency
@@ -774,7 +84,6 @@ print(f"YOLO segmentation model loaded successfully!")
 # Person class IDs in COCO dataset (0 = person)
 PERSON_CLASS_IDS = [0]
 
-
 # Raw match prediction
 class MatchPrediction(TypedDict):
     # Matched points before filtering with RANSAC
@@ -800,7 +109,6 @@ class FilteredMatchPrediction(MatchPrediction):
     mmkeypoints0_orig: np.ndarray  # RANSAC filtered matches in original image0 coordinates
     mmkeypoints1_orig: np.ndarray  # RANSAC filtered matches in original image1 coordinates
     mmconf: np.ndarray  # confidence scores for RANSAC filtered matches
-
 
 def load_matchanything_model(
     model_name: str = "matchanything_eloftr",
@@ -847,7 +155,6 @@ def load_matchanything_model(
         print(f"Using preprocessing config: {preprocessing_conf}")
 
     return model, preprocessing_conf
-
 
 def run_matching_simple(
     model: MatchAnything,
@@ -920,7 +227,6 @@ def run_matching_simple(
         print(f"Matching inference completed in {time.time() - t0:.3f}s")
 
     return result
-
 
 def filter_matches_ransac(
     prediction: MatchPrediction,
@@ -1029,56 +335,6 @@ def filter_matches_ransac(
 
     return result
 
-
-def warp_images_simple(
-    filtered_prediction: FilteredMatchPrediction,
-    log_timing: bool = False
-) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Warp images using the estimated homography matrix, replicating wrap_images functionality.
-
-    Args:
-        filtered_prediction: FilteredMatchPrediction from filter_matches_ransac
-        geom_type: Type of geometry ("Homography" or "Fundamental")
-        log_timing: Whether to log processing time
-
-    Returns:
-        Tuple of (visualization image, warped image1) or (None, None) if failed
-    """
-    if log_timing:
-        t0 = time.time()
-
-    # Check if we have a valid homography matrix
-    if len(filtered_prediction["H"]) == 0:
-        if log_timing:
-            print("No homography matrix available, cannot warp images")
-        return None, None
-
-    img0 = filtered_prediction["image0_orig"]
-    img1 = filtered_prediction["image1_orig"]
-    H = filtered_prediction["H"]
-
-    h0, w0, _ = img0.shape
-    h1, w1, _ = img1.shape
-
-    try:
-        # Warp img1 to img0's perspective using the homography matrix
-        rectified_image1 = cv2.warpPerspective(img1, H, (w0, h0))
-
-        # Create side-by-side visualization like the original
-        # Concatenate images horizontally for comparison
-        combined_img = np.concatenate([img0, rectified_image1], axis=1)
-
-        if log_timing:
-            print(f"Image warping completed in {time.time() - t0:.3f}s")
-
-        return combined_img, rectified_image1
-
-    except Exception as e:
-        print(f"Image warping failed with error: {e}")
-        return None, None
-
-
 def expand_box(bbox: np.ndarray, expansion_factor: float, img_width: Optional[int] = None, img_height: Optional[int] = None) -> tuple[int, int, int, int]:
     """
     Expand a bounding box by a given percentage.
@@ -1118,7 +374,6 @@ def expand_box(bbox: np.ndarray, expansion_factor: float, img_width: Optional[in
         new_y2 = min(img_height, new_y2)
 
     return new_x1, new_y1, new_x2, new_y2
-
 
 def get_person_masks(frame: np.ndarray,
                     segmentation_model,
@@ -1174,7 +429,6 @@ def get_person_masks(frame: np.ndarray,
 
     return combined_person_mask
 
-
 def apply_person_occlusion(frame_with_logo: np.ndarray,
                           original_frame: np.ndarray,
                           person_mask: np.ndarray,
@@ -1209,9 +463,6 @@ def apply_person_occlusion(frame_with_logo: np.ndarray,
 
     return result_frame
 
-
-#%%
-
 def map_budlight_to_spaten_coordinates(budlight_points: np.ndarray,
                                      center_x: int, center_y: int) -> np.ndarray:
     """
@@ -1238,145 +489,135 @@ def map_budlight_to_spaten_coordinates(budlight_points: np.ndarray,
 
     return spaten_points
 
-def create_logo_replacement_pipeline():
+def replace_logo_in_frame(video_frame: np.ndarray,
+                        budlight_bbox: np.ndarray,
+                        roma_model,
+                        preprocessing_conf: dict,
+                        expansion_factor: float = 0.1) -> np.ndarray:
     """
-    Create a complete pipeline for replacing Budlight with SPATEN in video frames.
+    Replace Budlight logo with SPATEN in a video frame.
+
+    Args:
+        video_frame: Original video frame with Budlight logo
+        budlight_bbox: Bounding box of Budlight logo [x1, y1, x2, y2]
+        roma_model: Loaded ROMA model for matching
+        preprocessing_conf: Preprocessing configuration
+        expansion_factor: Factor to expand bounding box
 
     Returns:
-        Dictionary containing all necessary components and functions
+        Video frame with SPATEN logo replacing Budlight and people brought forward
     """
+    # Expand bounding box
+    img_height, img_width = video_frame.shape[:2]
+    x1, y1, x2, y2 = expand_box(budlight_bbox, expansion_factor, img_width, img_height)
 
-    def replace_logo_in_frame(video_frame: np.ndarray,
-                            budlight_bbox: np.ndarray,
-                            roma_model,
-                            preprocessing_conf: dict,
-                            expansion_factor: float = 0.1) -> np.ndarray:
-        """
-        Replace Budlight logo with SPATEN in a video frame.
+    # Crop the physical logo from video frame
+    physical_logo_cropped = video_frame[y1:y2, x1:x2]
 
-        Args:
-            video_frame: Original video frame with Budlight logo
-            budlight_bbox: Bounding box of Budlight logo [x1, y1, x2, y2]
-            roma_model: Loaded ROMA model for matching
-            preprocessing_conf: Preprocessing configuration
-            expansion_factor: Factor to expand bounding box
+    # Step 1: Match physical logo with digital Budlight
+    match_pred = run_matching_simple(
+        roma_model,
+        physical_logo_cropped,
+        budlight_downsampled,  # Use the same Budlight logo used in overlay
+        preprocessing_conf=preprocessing_conf,
+        match_threshold=ROMA_CONFIDENCE_THRESHOLD,
+        extract_max_keypoints=MAX_KEYPOINTS,
+        log_timing=False
+    )
 
-        Returns:
-            Video frame with SPATEN logo replacing Budlight and people brought forward
-        """
-        # Expand bounding box
-        img_height, img_width = video_frame.shape[:2]
-        x1, y1, x2, y2 = expand_box(budlight_bbox, expansion_factor, img_width, img_height)
+    # Step 2: Filter matches with RANSAC
+    match_filtered = filter_matches_ransac(
+        match_pred,
+        ransac_reproj_threshold=RANSAC_THRESHOLD,
+        log_timing=False
+    )
 
-        # Crop the physical logo from video frame
-        physical_logo_cropped = video_frame[y1:y2, x1:x2]
+    if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
+        print(f"Failed to find sufficient matches ({len(match_filtered.get('mmkpts0', []))} < {MIN_KP_FOR_HOMOGRAPHY}), returning original frame")
+        return video_frame
 
-        # Step 1: Match physical logo with digital Budlight
-        match_pred = run_matching_simple(
-            roma_model,
-            physical_logo_cropped,
-            budlight_downsampled,  # Use the same Budlight logo used in overlay
-            preprocessing_conf=preprocessing_conf
+    # Step 3: Map Budlight keypoints to SPATEN keypoints
+    budlight_keypoints = match_filtered['mmkpts1']  # Keypoints in digital Budlight
+    spaten_keypoints = map_budlight_to_spaten_coordinates(budlight_keypoints, center_x, center_y)
+
+    # Step 4: Compute homography using physical logo keypoints -> SPATEN keypoints
+    physical_keypoints = match_filtered['mmkpts0']  # Keypoints in physical logo (cropped space)
+
+    # Transform physical keypoints to full frame coordinates
+    physical_keypoints_full_frame = physical_keypoints.copy()
+    physical_keypoints_full_frame[:, 0] += x1  # Add x offset
+    physical_keypoints_full_frame[:, 1] += y1  # Add y offset
+
+    # Compute homography: SPATEN -> full frame coordinates
+    H_spaten, mask = cv2.findHomography(
+        spaten_keypoints,  # Source: SPATEN coordinates
+        physical_keypoints_full_frame,  # Target: full frame coordinates
+        cv2.RANSAC,
+        ransacReprojThreshold=RANSAC_THRESHOLD,
+        confidence=0.999,
+        maxIters=10000
+    )
+
+    if H_spaten is None:
+        print("Failed to compute SPATEN homography, returning original frame")
+        return video_frame
+
+    # Step 5: Warp SPATEN logo to full frame size
+    frame_h, frame_w = video_frame.shape[:2]
+
+    if is_transparent:
+        # For transparent logo, remove alpha channel for warping
+        spaten_warped = cv2.warpPerspective(
+            spaten_resized[:,:,:3],  # Remove alpha channel for warping
+            H_spaten,
+            (frame_w, frame_h)
+        )
+    else:
+        # For non-transparent logo, use all channels
+        spaten_warped = cv2.warpPerspective(
+            spaten_resized,
+            H_spaten,
+            (frame_w, frame_h)
         )
 
-        # Step 2: Filter matches with RANSAC
-        match_filtered = filter_matches_ransac(match_pred)
-
-        if len(match_filtered['H']) == 0:
-            print("Failed to find sufficient matches, returning original frame")
-            return video_frame
-
-        # Step 3: Map Budlight keypoints to SPATEN keypoints
-        budlight_keypoints = match_filtered['mmkpts1']  # Keypoints in digital Budlight
-        spaten_keypoints = map_budlight_to_spaten_coordinates(budlight_keypoints, center_x, center_y)
-
-        # Step 4: Compute homography using physical logo keypoints -> SPATEN keypoints
-        physical_keypoints = match_filtered['mmkpts0']  # Keypoints in physical logo (cropped space)
-
-        # ✅ NEW: Transform physical keypoints to full frame coordinates
-        physical_keypoints_full_frame = physical_keypoints.copy()
-        physical_keypoints_full_frame[:, 0] += x1  # Add x offset
-        physical_keypoints_full_frame[:, 1] += y1  # Add y offset
-
-        # Compute homography: SPATEN -> full frame coordinates
-        H_spaten, mask = cv2.findHomography(
-            spaten_keypoints,  # Source: SPATEN coordinates
-            physical_keypoints_full_frame,  # Target: full frame coordinates
-            cv2.RANSAC,
-            ransacReprojThreshold=8.0,
-            confidence=0.999,
-            maxIters=10000
+    # Step 6: Create mask for entire frame and replace logo
+    if is_transparent:
+        # For transparent logo, use alpha channel for masking
+        spaten_alpha_warped = cv2.warpPerspective(
+            spaten_resized[:,:,3],  # Alpha channel only
+            H_spaten,
+            (frame_w, frame_h)
         )
+        mask = spaten_alpha_warped > 0
+    else:
+        # For non-transparent logo, use grayscale intensity for masking
+        spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
+        mask = spaten_gray > 0
 
-        if H_spaten is None:
-            print("Failed to compute SPATEN homography, returning original frame")
-            return video_frame
+    mask_3d = np.stack([mask, mask, mask], axis=-1)
 
-        # Step 5: Warp SPATEN logo to full frame size
-        frame_h, frame_w = video_frame.shape[:2]
+    # Replace logo in entire frame
+    frame_with_logo = video_frame.copy()
+    frame_with_logo[mask_3d] = spaten_warped[mask_3d]
 
-        if is_transparent:
-            # For transparent logo, remove alpha channel for warping
-            spaten_warped = cv2.warpPerspective(
-                spaten_resized[:,:,:3],  # Remove alpha channel for warping
-                H_spaten,
-                (frame_w, frame_h)  # ✅ NEW: Warp to full frame size
-            )
-        else:
-            # For non-transparent logo, use all channels
-            spaten_warped = cv2.warpPerspective(
-                spaten_resized,
-                H_spaten,
-                (frame_w, frame_h)  # ✅ NEW: Warp to full frame size
-            )
+    # Step 7: Get person masks and apply occlusion (bring people forward)
+    person_mask = get_person_masks(
+        video_frame,
+        person_seg_model,
+        confidence_threshold=0.5,
+        log_timing=False
+    )
 
-        # Step 6: Create mask for entire frame and replace logo
-        if is_transparent:
-            # For transparent logo, use alpha channel for masking
-            spaten_alpha_warped = cv2.warpPerspective(
-                spaten_resized[:,:,3],  # Alpha channel only
-                H_spaten,
-                (frame_w, frame_h)  # ✅ NEW: Warp alpha to full frame size
-            )
-            mask = spaten_alpha_warped > 0
-        else:
-            # For non-transparent logo, use grayscale intensity for masking
-            spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
-            mask = spaten_gray > 0
+    # Apply person occlusion to bring people in front of logo
+    result_frame = apply_person_occlusion(
+        frame_with_logo,
+        video_frame,  # Original frame
+        person_mask,
+        log_timing=False
+    )
 
-        mask_3d = np.stack([mask, mask, mask], axis=-1)
-
-        # ✅ NEW: Replace logo in entire frame (not just bounding box)
-        frame_with_logo = video_frame.copy()
-        frame_with_logo[mask_3d] = spaten_warped[mask_3d]
-
-        # ✅ NEW: Get person masks and apply occlusion (bring people forward)
-        print("Getting person masks for occlusion handling...")
-        person_mask = get_person_masks(
-            video_frame,
-            person_seg_model,
-            confidence_threshold=0.5,
-            log_timing=True
-        )
-
-        # Apply person occlusion to bring people in front of logo
-        result_frame = apply_person_occlusion(
-            frame_with_logo,
-            video_frame,  # Original frame
-            person_mask,
-            log_timing=True
-        )
-
-        return result_frame
-
-    return {
-        "budlight_reference": budlight_downsampled,
-        "spaten_replacement": spaten_resized,
-        "overlay_offset": (center_x, center_y),
-        "mapping_function": map_budlight_to_spaten_coordinates,
-        "replacement_pipeline": replace_logo_in_frame,
-        "is_transparent": is_transparent
-    }
+    print(f"Logo replacement successful with {len(match_filtered['mmkpts0'])} keypoints")
+    return result_frame
 
 # Load models once (this should be done at startup)
 print("Loading MatchAnything models...")
@@ -1384,18 +625,11 @@ print("Loading MatchAnything models...")
 model_type = "eloftr"
 
 if model_type == "roma":
-	model, preprocessing_conf = load_matchanything_model("matchanything_roma", log_timing=True)
+    model, preprocessing_conf = load_matchanything_model("matchanything_roma", log_timing=True)
 else:
-	model, preprocessing_conf = load_matchanything_model("matchanything_eloftr", log_timing=True)
+    model, preprocessing_conf = load_matchanything_model("matchanything_eloftr", log_timing=True)
 
-# Create the hybrid tracker
-print("Creating Hybrid Logo Tracker...")
-# Remove the HybridLogoTracker instantiation since we're using simple functions now
-
-# Create the complete pipeline
-logo_replacement_pipeline = create_logo_replacement_pipeline()
-
-print("Hybrid tracking system ready!")
+print("Simple frame-by-frame processing ready!")
 
 # Video processing parameters
 video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEncode_swappr_317.ts"
@@ -1403,13 +637,10 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 # 01:26:05-01:26:17
 # 01:53:12-01:53:15
 # 00:50:42-00:50:48
-start_timestamp = "00:50:42" # 00:36:37
-end_timestamp = "00:50:48"
-# 00:50:42_00:50:48
 start_timestamp = "00:50:42"
-end_timestamp="00:52:28"
+end_timestamp = "00:50:48"
 
-output_video_path = f"swapped_{model_type}_hybrid_{start_timestamp}_{end_timestamp}.mp4"
+output_video_path = f"swapped_{model_type}_simple_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
 tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
 
@@ -1441,12 +672,12 @@ plt.ion()  # Turn on interactive mode
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
 ax1.set_title('Original Frame')
 ax1.axis('off')
-ax2.set_title('Hybrid Logo Replacement Result')
+ax2.set_title('Simple Logo Replacement Result')
 ax2.axis('off')
 
-print(f"Starting hybrid video processing from frame {start_frame} to {end_frame}")
+print(f"Starting simple frame-by-frame processing from frame {start_frame} to {end_frame}")
 print(f"Video FPS: {video_fps}")
-print(f"Using hybrid tracking: ROMA every {MATCH_EVERY_N_FRAMES} frames, CoTracker3 for intermediate frames")
+print(f"Using MatchAnything {model_type} on every frame")
 
 # Performance tracking
 total_times = []
@@ -1466,16 +697,17 @@ while video_stream.isOpened():
 
     # Detect Budlight logo
     results: list[Results] = det_model_budlight.track(
-		frame, conf=0.8,
-		persist=True, # because we're inferencing in batches
-		tracker=tracker_config_path, stream=False,
-		verbose=False,
-	)
+        frame, conf=0.8,
+        persist=True,
+        tracker=tracker_config_path,
+        stream=False,
+        verbose=False,
+    )
 
     # Check if we have detection results
     if results and len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes.xyxy
-        confidences = results[0].boxes.conf  # Get confidence scores
+        confidences = results[0].boxes.conf
     else:
         boxes = None
         confidences = None
@@ -1502,19 +734,15 @@ while video_stream.isOpened():
                 best_idx = np.argmax(confidences_np)
                 budlight_bbox = boxes_np[best_idx]
                 best_confidence = confidences_np[best_idx]
-                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using highest confidence (conf={best_confidence:.3f}) at {budlight_bbox}")
+                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using highest confidence (conf={best_confidence:.3f})")
             else:
                 # No confidence scores available, use the first detection
                 budlight_bbox = boxes_np[0]
-                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using first detection at {budlight_bbox}")
+                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using first detection")
         else:
             # Single detection or squeeze to 1D
             budlight_bbox = boxes_np.squeeze()
-            if confidences_np is not None:
-                best_confidence = confidences_np.squeeze()
-                print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
-            else:
-                print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
+            print(f"Frame {current_frame_number}: Detected Budlight logo")
 
         # Ensure budlight_bbox is 1D array with 4 elements
         if budlight_bbox.shape != (4,):
@@ -1523,79 +751,16 @@ while video_stream.isOpened():
             current_frame_number += 1
             continue
 
-        # Get person masks for occlusion filtering
-        person_mask = get_person_masks(
-            frame_rgb,
-            person_seg_model,
-            confidence_threshold=0.5,
-            log_timing=False
-        )
-
-        # Get keypoints using hybrid tracking approach
-        frame_keypoints, reference_keypoints = get_keypoints_for_frame(
+        # Replace logo using simple frame-by-frame approach
+        result_frame = replace_logo_in_frame(
             frame_rgb,
             budlight_bbox,
-            person_mask,
             model,
-            preprocessing_conf
+            preprocessing_conf,
+            expansion_factor=0.1
         )
 
-        if frame_keypoints is not None and reference_keypoints is not None:
-            # Compute homography for logo replacement
-            spaten_keypoints = map_budlight_to_spaten_coordinates(reference_keypoints, center_x, center_y)
-            H_spaten = compute_homography_from_keypoints(frame_keypoints, spaten_keypoints)
-
-            if H_spaten is not None:
-                # Apply logo replacement using computed homography
-                frame_h, frame_w = frame_rgb.shape[:2]
-
-                if is_transparent:
-                    # For transparent logo, remove alpha channel for warping
-                    spaten_warped = cv2.warpPerspective(
-                        spaten_resized[:,:,:3],  # Remove alpha channel for warping
-                        H_spaten,
-                        (frame_w, frame_h)
-                    )
-                else:
-                    # For non-transparent logo, use all channels
-                    spaten_warped = cv2.warpPerspective(
-                        spaten_resized,
-                        H_spaten,
-                        (frame_w, frame_h)
-                    )
-
-                # Create mask for logo replacement
-                if is_transparent:
-                    # For transparent logo, use alpha channel for masking
-                    spaten_alpha_warped = cv2.warpPerspective(
-                        spaten_resized[:,:,3],  # Alpha channel only
-                        H_spaten,
-                        (frame_w, frame_h)
-                    )
-                    mask = spaten_alpha_warped > 0
-                else:
-                    # For non-transparent logo, use grayscale intensity for masking
-                    spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
-                    mask = spaten_gray > 0
-
-                mask_3d = np.stack([mask, mask, mask], axis=-1)
-
-                # Replace logo in entire frame
-                result_frame[mask_3d] = spaten_warped[mask_3d]
-
-                # Apply person occlusion to bring people in front of logo
-                result_frame = apply_person_occlusion(
-                    result_frame,
-                    frame_rgb,  # Original frame
-                    person_mask,
-                    log_timing=False
-                )
-
-                print(f"Frame {current_frame_number}: ✅ Logo replacement successful")
-            else:
-                print(f"Frame {current_frame_number}: ❌ Homography computation failed")
-        else:
-            print(f"Frame {current_frame_number}: ❌ Keypoint detection/tracking failed")
+        print(f"Frame {current_frame_number}: ✅ Logo processing completed")
     else:
         print(f"Frame {current_frame_number}: No Budlight logo detected")
 
@@ -1611,7 +776,7 @@ while video_stream.isOpened():
 
     ax2.clear()
     ax2.imshow(result_frame)
-    ax2.set_title(f'Hybrid Logo Replacement Result {current_frame_number}')
+    ax2.set_title(f'Simple Logo Replacement Result {current_frame_number}')
     ax2.axis('off')
 
     plt.draw()
@@ -1632,7 +797,7 @@ plt.show()
 
 # Print performance statistics
 print("\n" + "="*50)
-print("HYBRID TRACKING PERFORMANCE STATISTICS")
+print("SIMPLE FRAME-BY-FRAME PERFORMANCE STATISTICS")
 print("="*50)
 
 if total_times:
@@ -1641,7 +806,6 @@ if total_times:
     print(f"Average frame time: {avg_frame_time:.3f}s")
     print(f"Average FPS: {avg_fps:.1f}")
     print(f"Total frames processed: {len(total_times)}")
-    print(f"ROMA recalibrations: {len(total_times) // MATCH_EVERY_N_FRAMES + 1}")
-    print(f"CoTracker trackings: {len(total_times) - (len(total_times) // MATCH_EVERY_N_FRAMES + 1)}")
+    print(f"MatchAnything calls per frame: 1 (when logo detected)")
 
-print("Video processing completed with simplified hybrid tracking!")
+print("Simple frame-by-frame video processing completed!")
