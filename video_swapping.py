@@ -33,666 +33,420 @@ from imcui.ui.utils import (
 )
 
 # Hybrid tracking configuration
-MATCH_EVERY_N_FRAMES = 120
-MAX_KP_TO_TRACK = 2000
-MIN_KP_FOR_HOMOGRAPHY = 100
-ROMA_CONFIDENCE_THRESHOLD = 0.02  # Increased from 0.01
+MATCH_EVERY_N_FRAMES = 160
+MAX_KP_TO_TRACK = 50
+MIN_KP_FOR_HOMOGRAPHY = 100  # Increased from default
+ROMA_CONFIDENCE_THRESHOLD = 0.05  # Increased from 0.02
 COTRACKER_INPUT_RESOLUTION = (384, 512)  # H, W for CoTracker3
 
+# Memory optimization settings
+USE_MIXED_PRECISION = True  # Enable half precision for memory savings
+REDUCE_FRAME_BUFFER_SIZE = True  # Use minimal frame buffer
+COTRACKER_FRAME_BUFFER_SIZE = 16  # Reduced from 32 (model.step * 2)
+PROCESS_RESOLUTION_SCALE = 0.8  # Process at 80% resolution to save memory
+UNLOAD_MODELS_BETWEEN_FRAMES = False  # Extreme memory saving (slower)
+ENABLE_MEMORY_MONITORING = True  # Monitor GPU memory usage
 
-logger = logging.getLogger(__name__)
+# Global variables for tracking state
+cotracker_model = None
+cotracker_initialized = False
+cotracker_queries = None
+frame_buffer = []
+current_keypoints = None
+reference_keypoints = None
+frame_counter = 0
 
-class HybridLogoTracker:
+def get_gpu_memory_usage():
+    """Get current GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / (1024**2)
+    return 0
+
+def log_memory_usage(stage: str):
+    """Log GPU memory usage at different stages."""
+    if ENABLE_MEMORY_MONITORING and torch.cuda.is_available():
+        memory_mb = get_gpu_memory_usage()
+        print(f"GPU Memory [{stage}]: {memory_mb:.1f} MB")
+
+def clear_gpu_memory():
+    """Clear GPU memory and run garbage collection."""
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+def unload_cotracker_model():
+    """Unload CoTracker model to free memory (extreme memory saving)."""
+    global cotracker_model, cotracker_initialized
+    if cotracker_model is not None:
+        del cotracker_model
+        cotracker_model = None
+        cotracker_initialized = False
+        clear_gpu_memory()
+        print("CoTracker model unloaded to save memory")
+
+def initialize_cotracker():
+    """Initialize CoTracker3 online model with memory optimizations."""
+    global cotracker_model
+    if cotracker_model is None:
+        log_memory_usage("Before CoTracker loading")
+        print("Loading CoTracker3 online model with memory optimizations...")
+        with torch.inference_mode():  # Memory optimization
+            cotracker_model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            cotracker_model = cotracker_model.to(device)
+            
+            # Use mixed precision for memory savings
+            if USE_MIXED_PRECISION and torch.cuda.is_available():
+                cotracker_model = cotracker_model.half()  # Convert to half precision
+                print("CoTracker3 converted to half precision for memory savings")
+            
+        print(f"CoTracker3 online model loaded successfully! Step size: {cotracker_model.step}")
+        clear_gpu_memory()  # Clear memory after loading
+        log_memory_usage("After CoTracker loading")
+
+def detect_keypoints_with_roma(frame: np.ndarray, 
+                              logo_bbox: np.ndarray,
+                              roma_model,
+                              preprocessing_conf: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Hybrid tracking system that combines MatchAnything ROMA with CoTracker3
-    for efficient and robust logo keypoint tracking.
+    Detect keypoints using MatchAnything ROMA model with memory optimizations.
+    
+    Args:
+        frame: Current frame
+        logo_bbox: Logo bounding box [x1, y1, x2, y2]
+        roma_model: ROMA model
+        preprocessing_conf: Preprocessing configuration
+        
+    Returns:
+        Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
     """
-
-    def __init__(self,
-                 roma_model: MatchAnything,
-                 roma_preprocessing_conf: dict,
-                 budlight_reference: np.ndarray,
-                 device: str = "cuda"):
-        """
-        Initialize the hybrid tracker.
-
-        Args:
-            roma_model: Loaded MatchAnything ROMA model
-            roma_preprocessing_conf: Preprocessing configuration for ROMA
-            budlight_reference: Reference Budlight logo image
-            device: Device to run models on
-        """
-        self.roma_model = roma_model
-        self.roma_preprocessing_conf = roma_preprocessing_conf
-        self.budlight_reference = budlight_reference
-        self.device = device
-
-        # Initialize CoTracker3 online model
-        self.cotracker_model = None
-        self.cotracker_initialized = False
-        self.cotracker_step = 8  # Default step size for CoTracker3
-
-        # Frame buffer for CoTracker3 online processing
-        self.frame_buffer: list[np.ndarray] = []
-        self.frame_buffer_max_size = 32  # Keep enough frames for processing
-
-        # Tracking state
-        self.current_keypoints = None  # [N, 2] keypoints in full frame coordinates
-        self.reference_keypoints = None  # [N, 2] keypoints in reference logo coordinates
-        self.queries = None  # Queries tensor for CoTracker3
-        self.tracking_active = False
-        self.frame_counter = 0
-
-        # 🔥 NEW: Fallback system for continuous logo replacement
-        self.last_good_homography = None  # Store last successful homography
-        self.last_good_keypoints = None  # Store last successful keypoints
-        self.last_good_reference_keypoints = None  # Store last successful reference keypoints
-        self.consecutive_failures = 0  # Track consecutive failures
-        self.max_consecutive_failures = 3  # Max failures before emergency fallback
-        self.emergency_fallback_active = False  # Flag for emergency mode
-
-        # Performance tracking
-        self.roma_times = []
-        self.cotracker_times = []
-        self.fallback_usage_count = 0
-        self.emergency_fallback_count = 0
-
-    def _initialize_cotracker(self) -> None:
-        """Initialize CoTracker3 online model."""
-        if self.cotracker_model is None:
-            print("Loading CoTracker3 online model...")
-            self.cotracker_model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online")
-            self.cotracker_model = self.cotracker_model.to(self.device)
-            self.cotracker_step = self.cotracker_model.step
-            print(f"CoTracker3 online model loaded successfully! Step size: {self.cotracker_step}")
-
-    def _detect_keypoints_with_roma(self,
-                                   frame: np.ndarray,
-                                   logo_bbox: np.ndarray,
-                                   log_timing: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """
-        Detect keypoints using MatchAnything ROMA model.
-
-        Args:
-            frame: Current frame
-            logo_bbox: Logo bounding box [x1, y1, x2, y2]
-            log_timing: Whether to log timing information
-
-        Returns:
-            Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
-        """
-        if log_timing:
-            t0 = time.time()
-
-        try:
-            # Expand bounding box
-            img_height, img_width = frame.shape[:2]
-            x1, y1, x2, y2 = expand_box(logo_bbox, 0.1, img_width, img_height)
-
-            # Crop logo region
-            physical_logo_cropped = frame[y1:y2, x1:x2]
-
-            # Run ROMA matching
-            match_pred = run_matching_simple(
-                self.roma_model,
-                physical_logo_cropped,
-                self.budlight_reference,
-                preprocessing_conf=self.roma_preprocessing_conf,
-                match_threshold=ROMA_CONFIDENCE_THRESHOLD,
-                extract_max_keypoints=MAX_KP_TO_TRACK * 2,  # Get more, filter later
-                log_timing=False
-            )
-
-            # Filter matches with RANSAC
-            match_filtered = filter_matches_ransac(match_pred, log_timing=False)
-
-            if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
-                if log_timing:
-                    print(f"ROMA: Insufficient matches ({len(match_filtered.get('mmkpts0', []))}) for reliable tracking")
-                return None, None
-
-            # Get keypoints in cropped coordinates
-            frame_keypoints_cropped = match_filtered['mmkpts0']  # [N, 2]
-            reference_keypoints = match_filtered['mmkpts1']  # [N, 2]
-
-            # Convert to full frame coordinates
-            frame_keypoints_full = frame_keypoints_cropped.copy()
-            frame_keypoints_full[:, 0] += x1  # Add x offset
-            frame_keypoints_full[:, 1] += y1  # Add y offset
-
-            # Select best keypoints if we have too many
-            if len(frame_keypoints_full) > MAX_KP_TO_TRACK:
-                # Sort by confidence and take top MAX_KP_TO_TRACK
-                confidences = match_filtered['mmconf']
-                top_indices = np.argsort(confidences)[-MAX_KP_TO_TRACK:]
-                frame_keypoints_full = frame_keypoints_full[top_indices]
-                reference_keypoints = reference_keypoints[top_indices]
-
-            if log_timing:
-                roma_time = time.time() - t0
-                self.roma_times.append(roma_time)
-                print(f"ROMA: Detected {len(frame_keypoints_full)} keypoints in {roma_time:.3f}s")
-
-            return frame_keypoints_full, reference_keypoints
-
-        except Exception as e:
-            print(f"ROMA keypoint detection failed: {e}")
-            return None, None
-
-    def _initialize_cotracker_online(self,
-                                    initial_frame: np.ndarray,
-                                    initial_keypoints: np.ndarray) -> bool:
-        """
-        Initialize CoTracker3 online processing with initial frame and keypoints.
-
-        Args:
-            initial_frame: Initial frame for CoTracker3
-            initial_keypoints: Initial keypoints [N, 2] in full frame coordinates
-
-        Returns:
-            True if initialization successful, False otherwise
-        """
-        try:
-            # Ensure CoTracker model is loaded
-            self._initialize_cotracker()
-
-            if self.cotracker_model is None:
-                print(f"      🔍 DEBUG: CoTracker model is None, initialization failed")
-                return False
-
-            # 🔍 DEBUG: Log initialization parameters
-            print(f"      🔍 DEBUG: Initializing CoTracker online with {len(initial_keypoints)} keypoints")
-            print(f"      🔍 DEBUG: Frame shape: {initial_frame.shape}")
-            print(f"      🔍 DEBUG: CoTracker input resolution: {COTRACKER_INPUT_RESOLUTION}")
-
-            # Prepare frame tensor - CoTracker3 online expects [B, T, C, H, W]
-            frame_resized = cv2.resize(initial_frame, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
-            frame_tensor = torch.from_numpy(frame_resized).float().to(self.device)
-            frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-
-            # Scale keypoints to CoTracker resolution
-            frame_height, frame_width = initial_frame.shape[:2]
-            scaled_keypoints = initial_keypoints.copy()
-            scaled_keypoints[:, 0] *= COTRACKER_INPUT_RESOLUTION[1] / frame_width   # Scale x
-            scaled_keypoints[:, 1] *= COTRACKER_INPUT_RESOLUTION[0] / frame_height  # Scale y
-
-            # Prepare queries tensor: [1, N, 3] where each point is [t, x, y]
-            # t=0 since we're initializing on the first frame
-            num_points = len(scaled_keypoints)
-            queries = torch.zeros(1, num_points, 3).to(self.device)
-            queries[0, :, 0] = 0  # Time index (first frame)
-            queries[0, :, 1] = torch.from_numpy(scaled_keypoints[:, 0]).float()  # x coordinates
-            queries[0, :, 2] = torch.from_numpy(scaled_keypoints[:, 1]).float()  # y coordinates
-
-            # Store queries for later use
-            self.queries = queries
-
-            # 🔍 DEBUG: Log queries tensor
-            print(f"      🔍 DEBUG: queries shape: {queries.shape}")
-            print(f"      🔍 DEBUG: queries range: t({queries[0, :, 0].min():.1f}-{queries[0, :, 0].max():.1f}), x({queries[0, :, 1].min():.1f}-{queries[0, :, 1].max():.1f}), y({queries[0, :, 2].min():.1f}-{queries[0, :, 2].max():.1f})")
-
-            # Initialize CoTracker3 online processing
-            print(f"      🔍 DEBUG: Calling CoTracker3 online initialization...")
-            result = self.cotracker_model(
-                video_chunk=frame_tensor,
-                is_first_step=True,
-                grid_size=0,
-                queries=queries,
-                add_support_grid=False
-            )
-
-            # 🔍 DEBUG: Log initialization result
-            print(f"      🔍 DEBUG: Initialization result: {result}")
-
-            # Initialize frame buffer with the first frame
-            self.frame_buffer = [initial_frame]
-
-            self.cotracker_initialized = True
-            print(f"CoTracker3 online initialized with {num_points} keypoints")
-            return True
-
-        except Exception as e:
-            print(f"CoTracker3 online initialization failed: {e}")
-            print(f"      🔍 DEBUG: Initialization exception type: {type(e)}")
-            print(f"      🔍 DEBUG: Initialization exception args: {e.args}")
-            self.cotracker_initialized = False
-            return False
-
-    def _track_keypoints_with_cotracker_online(self,
-                                              frame: np.ndarray,
-                                              log_timing: bool = True) -> Optional[np.ndarray]:
-        """
-        Track keypoints using CoTracker3 online model.
-
-        Args:
-            frame: Current frame
-            log_timing: Whether to log timing information
-
-        Returns:
-            Tracked keypoints [N, 2] in full frame coordinates or None if failed
-        """
-        if not self.cotracker_initialized or self.queries is None or self.cotracker_model is None:
-            return None
-
-        if log_timing:
-            t0 = time.time()
-
-        try:
-            # Add frame to buffer
-            self.frame_buffer.append(frame)
-
-            # Keep buffer size manageable
-            if len(self.frame_buffer) > self.frame_buffer_max_size:
-                self.frame_buffer = self.frame_buffer[-self.frame_buffer_max_size:]
-
-            # Check if we have enough frames for processing
-            if len(self.frame_buffer) < self.cotracker_step * 2:
-                print(f"      🔍 DEBUG: Not enough frames in buffer ({len(self.frame_buffer)} < {self.cotracker_step * 2})")
-                return None
-
-            # Prepare video chunk - take the last cotracker_step * 2 frames
-            video_chunk_frames = self.frame_buffer[-self.cotracker_step * 2:]
-
-            # Resize frames to CoTracker resolution
-            video_chunk_resized = []
-            for frame_i in video_chunk_frames:
-                frame_resized = cv2.resize(frame_i, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
-                video_chunk_resized.append(frame_resized)
-
-            # Convert to tensor [1, T, C, H, W]
-            video_chunk_tensor = torch.from_numpy(np.stack(video_chunk_resized)).float().to(self.device)
-            video_chunk_tensor = video_chunk_tensor.permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, 3, H, W]
-
-            # 🔍 DEBUG: Log tensor shapes before CoTracker call
-            print(f"      🔍 DEBUG: video_chunk_tensor shape: {video_chunk_tensor.shape}")
-            print(f"      🔍 DEBUG: queries shape: {self.queries.shape}")
-
-            # Run CoTracker3 online inference
-            pred_tracks, pred_visibility = self.cotracker_model(
-                video_chunk=video_chunk_tensor,
-                grid_size=0,
-                queries=self.queries,
-                add_support_grid=False
-            )
-
-            # 🔍 DEBUG: Log output tensor shapes
-            print(f"      🔍 DEBUG: pred_tracks shape: {pred_tracks.shape if pred_tracks is not None else 'None'}")
-            print(f"      🔍 DEBUG: pred_visibility shape: {pred_visibility.shape if pred_visibility is not None else 'None'}")
-
-            # Validate outputs
-            if pred_tracks is None or pred_visibility is None:
-                print(f"      🔍 DEBUG: CoTracker returned None outputs")
-                return None
-
-            # Get tracks for the last frame (most recent)
-            try:
-                # pred_tracks shape: [B, T, N, 2], we want the last frame
-                last_frame_tracks = pred_tracks[0, -1].cpu().numpy()  # [N, 2]
-                last_frame_visibility = pred_visibility[0, -1].cpu().numpy()  # [N]
-
-                print(f"      🔍 DEBUG: last_frame_tracks shape: {last_frame_tracks.shape}")
-                print(f"      🔍 DEBUG: last_frame_visibility shape: {last_frame_visibility.shape}")
-            except Exception as index_error:
-                print(f"      🔍 DEBUG: Indexing error: {index_error}")
-                print(f"      🔍 DEBUG: pred_tracks shape: {pred_tracks.shape}")
-                print(f"      🔍 DEBUG: pred_visibility shape: {pred_visibility.shape}")
-                return None
-
-            # Scale from CoTracker resolution to full frame resolution
-            frame_height, frame_width = frame.shape[:2]
-            last_frame_tracks[:, 0] *= frame_width / COTRACKER_INPUT_RESOLUTION[1]   # Scale x
-            last_frame_tracks[:, 1] *= frame_height / COTRACKER_INPUT_RESOLUTION[0]  # Scale y
-
-            # Validate tracking results
-            if len(last_frame_tracks) == 0:
-                print(f"      🔍 DEBUG: No valid tracks after scaling")
-                return None
-
-            # Check for reasonable keypoint positions
-            valid_x = (last_frame_tracks[:, 0] >= 0) & (last_frame_tracks[:, 0] < frame_width)
-            valid_y = (last_frame_tracks[:, 1] >= 0) & (last_frame_tracks[:, 1] < frame_height)
-            valid_points = valid_x & valid_y
-
-            if np.sum(valid_points) < len(last_frame_tracks) * 0.5:  # Less than 50% valid points
-                print(f"      🔍 DEBUG: Too many invalid tracking points ({np.sum(valid_points)}/{len(last_frame_tracks)})")
-                return None
-
-            if log_timing:
-                cotracker_time = time.time() - t0
-                self.cotracker_times.append(cotracker_time)
-                visible_count = np.sum(last_frame_visibility > 0.5)
-                print(f"CoTracker3 Online: Tracked {len(last_frame_tracks)} keypoints ({visible_count} visible) in {cotracker_time:.3f}s")
-
-            return last_frame_tracks
-
-        except Exception as e:
-            logger.exception("CoTracker3 online tracking failed")
-            print(f"CoTracker3 online tracking failed: {e}")
-            print(f"      🔍 DEBUG: Exception type: {type(e)}")
-            print(f"      🔍 DEBUG: Exception args: {e.args}")
-
-            # Reset CoTracker on failure to prevent persistent state issues
-            print(f"      🔍 DEBUG: Resetting CoTracker3 online due to failure...")
-            self.cotracker_initialized = False
-            self.cotracker_model = None
-            self.tracking_active = False
-            self.frame_buffer = []
-            self.queries = None
-
-            return None
-
-    def _filter_occluded_keypoints(self,
-                                  keypoints: np.ndarray,
-                                  person_masks: np.ndarray,
-                                  reference_keypoints: np.ndarray,
-                                  dilation_size: int = 5) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Filter keypoints that are occluded by people.
-
-        Args:
-            keypoints: Keypoints [N, 2] in full frame coordinates
-            person_masks: Person segmentation masks [H, W]
-            reference_keypoints: Reference keypoints [N, 2] in logo coordinates
-            dilation_size: Dilation size for person masks
-
-        Returns:
-            Tuple of (filtered_keypoints, filtered_reference_keypoints)
-        """
-        if len(keypoints) == 0 or len(reference_keypoints) == 0:
-            return keypoints, reference_keypoints
-
-        # Dilate person masks slightly to be more conservative
-        kernel = np.ones((dilation_size, dilation_size), np.uint8)
-        person_masks_dilated = cv2.dilate(person_masks, kernel, iterations=1)
-
-        # Check which keypoints are not occluded
-        valid_mask = np.ones(len(keypoints), dtype=bool)
-
-        for i, (x, y) in enumerate(keypoints):
-            # Check if keypoint is within frame bounds
-            if x < 0 or y < 0 or x >= person_masks.shape[1] or y >= person_masks.shape[0]:
-                valid_mask[i] = False
-                continue
-
-            # Check if keypoint is occluded by person
-            if person_masks_dilated[int(y), int(x)] > 0:
-                valid_mask[i] = False
-
-        # Filter keypoints
-        filtered_keypoints = keypoints[valid_mask]
-        filtered_reference_keypoints = reference_keypoints[valid_mask]
-
-        return filtered_keypoints, filtered_reference_keypoints
-
-    def process_frame(self,
-                     frame: np.ndarray,
-                     logo_bbox: np.ndarray,
-                     person_masks: np.ndarray,
-                     log_timing: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """
-        Process a single frame to get keypoints for homography computation.
-
-        Args:
-            frame: Current frame
-            logo_bbox: Logo bounding box [x1, y1, x2, y2]
-            person_masks: Person segmentation masks [H, W]
-            log_timing: Whether to log timing information
-
-        Returns:
-            Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
-        """
-        self.frame_counter += 1
-        is_recalibration_frame = self.frame_counter % MATCH_EVERY_N_FRAMES == 1 or not self.tracking_active
-
-        if log_timing:
-            print(f"\n🔍 FRAME {self.frame_counter} DEBUG:")
-            print(f"  - Recalibration frame: {is_recalibration_frame}")
-            print(f"  - Tracking active: {self.tracking_active}")
-            print(f"  - Frame counter mod: {self.frame_counter % MATCH_EVERY_N_FRAMES}")
-
-        # Check if we need to recalibrate with ROMA
-        if is_recalibration_frame:
-            if log_timing:
-                print(f"  🔄 STARTING ROMA RECALIBRATION...")
-
-            # Recalibration phase: Use ROMA to detect keypoints
-            frame_kp, ref_kp = self._detect_keypoints_with_roma(frame, logo_bbox, log_timing)
-
-            if frame_kp is not None and ref_kp is not None:
-                if log_timing:
-                    print(f"  ✅ ROMA SUCCESS: {len(frame_kp)} keypoints detected")
-
-                # Filter occluded keypoints
-                frame_kp_filtered, ref_kp_filtered = self._filter_occluded_keypoints(
-                    frame_kp, person_masks, ref_kp
-                )
-
-                if len(frame_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
-                    if log_timing:
-                        print(f"  ✅ OCCLUSION FILTER SUCCESS: {len(frame_kp_filtered)} keypoints remain")
-
-                    # Update tracking state
-                    self.current_keypoints = frame_kp_filtered
-                    self.reference_keypoints = ref_kp_filtered
-
-                    # Initialize CoTracker3 online for next frames
-                    if self._initialize_cotracker_online(frame, frame_kp_filtered):
-                        self.tracking_active = True
-                        if log_timing:
-                            print(f"  ✅ COTRACKER3 ONLINE INIT SUCCESS")
-                            print(f"  🎯 FRAME {self.frame_counter}: ROMA recalibration successful, {len(frame_kp_filtered)} keypoints")
-                        return frame_kp_filtered, ref_kp_filtered
-                    else:
-                        if log_timing:
-                            print(f"  ❌ COTRACKER3 ONLINE INIT FAILED")
-                            print(f"  🚨 FRAME {self.frame_counter}: CoTracker3 online initialization failed")
-                        return None, None
-                else:
-                    if log_timing:
-                        print(f"  ❌ INSUFFICIENT KEYPOINTS: {len(frame_kp_filtered)} < {MIN_KP_FOR_HOMOGRAPHY}")
-                        print(f"  🚨 FRAME {self.frame_counter}: Insufficient keypoints after occlusion filtering ({len(frame_kp_filtered)})")
-                    return None, None
-            else:
-                if log_timing:
-                    print(f"  ❌ ROMA DETECTION FAILED")
-                    print(f"  🚨 FRAME {self.frame_counter}: ROMA keypoint detection failed")
-                return None, None
-
+    # Memory optimization: Use inference mode for all operations
+    with torch.inference_mode():
+        log_memory_usage("Before ROMA processing")
+        
+        # Expand bounding box
+        img_height, img_width = frame.shape[:2]
+        x1, y1, x2, y2 = expand_box(logo_bbox, 0.1, img_width, img_height)
+        
+        # Crop logo region
+        physical_logo_cropped = frame[y1:y2, x1:x2]
+        
+        # Memory optimization: Reduce processing resolution if needed
+        if PROCESS_RESOLUTION_SCALE < 1.0:
+            new_h = int(physical_logo_cropped.shape[0] * PROCESS_RESOLUTION_SCALE)
+            new_w = int(physical_logo_cropped.shape[1] * PROCESS_RESOLUTION_SCALE)
+            physical_logo_cropped = cv2.resize(physical_logo_cropped, (new_w, new_h))
+            # Scale coordinates back later
+            scale_factor = 1.0 / PROCESS_RESOLUTION_SCALE
         else:
-            if log_timing:
-                print(f"  🏃 COTRACKER3 ONLINE TRACKING...")
+            scale_factor = 1.0
+        
+        # Run ROMA matching
+        match_pred = run_matching_simple(
+            roma_model,
+            physical_logo_cropped,
+            budlight_downsampled,
+            preprocessing_conf=preprocessing_conf,
+            match_threshold=ROMA_CONFIDENCE_THRESHOLD,
+            extract_max_keypoints=MAX_KP_TO_TRACK,
+            log_timing=False
+        )
+        
+        # Filter matches with RANSAC
+        match_filtered = filter_matches_ransac(match_pred, log_timing=False)
+        
+        if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
+            print(f"ROMA: Insufficient matches ({len(match_filtered.get('mmkpts0', []))}) for reliable tracking")
+            return None, None
+        
+        # Get keypoints in cropped coordinates
+        frame_keypoints_cropped = match_filtered['mmkpts0']  # [N, 2]
+        reference_keypoints = match_filtered['mmkpts1']  # [N, 2]
+        
+        # Scale keypoints back if resolution was reduced
+        if scale_factor != 1.0:
+            frame_keypoints_cropped = frame_keypoints_cropped * scale_factor
+        
+        # Convert to full frame coordinates
+        frame_keypoints_full = frame_keypoints_cropped.copy()
+        frame_keypoints_full[:, 0] += x1  # Add x offset
+        frame_keypoints_full[:, 1] += y1  # Add y offset
+        
+        print(f"ROMA: Detected {len(frame_keypoints_full)} keypoints")
+        
+        # Memory cleanup
+        del match_pred, match_filtered, physical_logo_cropped
+        clear_gpu_memory()
+        log_memory_usage("After ROMA processing")
+        
+        return frame_keypoints_full, reference_keypoints
 
-            # Tracking phase: Use CoTracker3 online to track existing keypoints
-            tracked_kp = self._track_keypoints_with_cotracker_online(frame, log_timing)
+def initialize_cotracker_online(initial_frame: np.ndarray, 
+                               initial_keypoints: np.ndarray) -> bool:
+    """
+    Initialize CoTracker3 online processing with memory optimizations.
+    
+    Args:
+        initial_frame: Initial frame for CoTracker3
+        initial_keypoints: Initial keypoints [N, 2] in full frame coordinates
+        
+    Returns:
+        True if initialization successful, False otherwise
+    """
+    global cotracker_initialized, cotracker_queries, frame_buffer
+    
+    # Memory optimization: Use inference mode
+    with torch.inference_mode():
+        # Ensure CoTracker model is loaded
+        initialize_cotracker()
+        
+        if cotracker_model is None:
+            return False
+        
+        # Prepare frame tensor - CoTracker3 online expects [B, T, C, H, W]
+        frame_resized = cv2.resize(initial_frame, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
+        frame_tensor = torch.from_numpy(frame_resized).float()
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        frame_tensor = frame_tensor.to(device)
+        
+        # Use mixed precision if enabled
+        if USE_MIXED_PRECISION and torch.cuda.is_available():
+            frame_tensor = frame_tensor.half()
+        
+        frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
+        
+        # Scale keypoints to CoTracker resolution
+        frame_height, frame_width = initial_frame.shape[:2]
+        scaled_keypoints = initial_keypoints.copy()
+        scaled_keypoints[:, 0] *= COTRACKER_INPUT_RESOLUTION[1] / frame_width   # Scale x
+        scaled_keypoints[:, 1] *= COTRACKER_INPUT_RESOLUTION[0] / frame_height  # Scale y
+        
+        # Prepare queries tensor: [1, N, 3] where each point is [t, x, y]
+        num_points = len(scaled_keypoints)
+        queries = torch.zeros(1, num_points, 3).to(device)
+        
+        # Use mixed precision if enabled
+        if USE_MIXED_PRECISION and torch.cuda.is_available():
+            queries = queries.half()
+        
+        queries[0, :, 0] = 0  # Time index (first frame)
+        queries[0, :, 1] = torch.from_numpy(scaled_keypoints[:, 0]).float().to(device)
+        queries[0, :, 2] = torch.from_numpy(scaled_keypoints[:, 1]).float().to(device)
+        
+        # Use mixed precision if enabled
+        if USE_MIXED_PRECISION and torch.cuda.is_available():
+            queries[0, :, 1] = queries[0, :, 1].half()
+            queries[0, :, 2] = queries[0, :, 2].half()
+        
+        # Store queries for later use
+        cotracker_queries = queries
+        
+        # Initialize CoTracker3 online processing
+        cotracker_model(
+            video_chunk=frame_tensor,
+            is_first_step=True,
+            grid_size=0,
+            queries=queries,
+            add_support_grid=False
+        )
+        
+        # Memory optimization: Use smaller frame buffer
+        buffer_size = COTRACKER_FRAME_BUFFER_SIZE if REDUCE_FRAME_BUFFER_SIZE else (cotracker_model.step * 2)
+        frame_buffer = [initial_frame] * buffer_size
+        
+        cotracker_initialized = True
+        print(f"CoTracker3 online initialized with {num_points} keypoints (buffer size: {buffer_size})")
+        
+        # Memory cleanup
+        del frame_tensor, queries
+        clear_gpu_memory()
+        
+        return True
 
-            if tracked_kp is not None and len(tracked_kp) > 0 and self.reference_keypoints is not None:
-                if log_timing:
-                    print(f"  ✅ COTRACKER3 ONLINE SUCCESS: {len(tracked_kp)} keypoints tracked")
-
-                # Filter occluded keypoints
-                tracked_kp_filtered, ref_kp_filtered = self._filter_occluded_keypoints(
-                    tracked_kp, person_masks, self.reference_keypoints
-                )
-
-                if len(tracked_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
-                    # Update current keypoints
-                    self.current_keypoints = tracked_kp_filtered
-                    if log_timing:
-                        print(f"  ✅ OCCLUSION FILTER SUCCESS: {len(tracked_kp_filtered)} keypoints remain")
-                        print(f"  🎯 FRAME {self.frame_counter}: CoTracker3 online tracking successful, {len(tracked_kp_filtered)} keypoints")
-                    return tracked_kp_filtered, ref_kp_filtered
-                else:
-                    # Not enough keypoints, trigger immediate recalibration
-                    if log_timing:
-                        print(f"  ❌ INSUFFICIENT KEYPOINTS: {len(tracked_kp_filtered)} < {MIN_KP_FOR_HOMOGRAPHY}")
-                        print(f"  🔄 TRIGGERING IMMEDIATE RECALIBRATION")
-                        print(f"  🚨 FRAME {self.frame_counter}: Insufficient keypoints after filtering ({len(tracked_kp_filtered)}), triggering recalibration")
-                    self.frame_counter = MATCH_EVERY_N_FRAMES  # Force recalibration on next call
-                    self.tracking_active = False
-                    return None, None
-            else:
-                # Tracking failed, trigger immediate recalibration
-                if log_timing:
-                    print(f"  ❌ COTRACKER3 ONLINE TRACKING FAILED")
-                    print(f"  🔄 TRIGGERING IMMEDIATE RECALIBRATION")
-                    print(f"  🚨 FRAME {self.frame_counter}: CoTracker3 online tracking failed, triggering recalibration")
-                self.frame_counter = MATCH_EVERY_N_FRAMES  # Force recalibration on next call
-                self.tracking_active = False
-                return None, None
-
-    def _compute_emergency_homography(self, frame: np.ndarray, logo_bbox: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Emergency fallback: Use traditional 4-corner approach when hybrid tracking fails.
-
-        Args:
-            frame: Current frame
-            logo_bbox: Logo bounding box [x1, y1, x2, y2]
-
-        Returns:
-            Emergency homography matrix or None if failed
-        """
-        try:
-            print(f"  🚨 EMERGENCY FALLBACK: Using 4-corner approach")
-
-            # Expand bounding box
-            img_height, img_width = frame.shape[:2]
-            x1, y1, x2, y2 = expand_box(logo_bbox, 0.1, img_width, img_height)
-
-            # Crop logo region
-            physical_logo_cropped = frame[y1:y2, x1:x2]
-
-            # Run ROMA matching with lower thresholds for emergency
-            match_pred = run_matching_simple(
-                self.roma_model,
-                physical_logo_cropped,
-                self.budlight_reference,
-                preprocessing_conf=self.roma_preprocessing_conf,
-                match_threshold=0.005,  # Lower threshold for emergency
-                extract_max_keypoints=200,  # Fewer keypoints for stability
-                log_timing=False
-            )
-
-            # Filter matches with RANSAC
-            match_filtered = filter_matches_ransac(match_pred, log_timing=False)
-
-            if len(match_filtered['H']) > 0 and len(match_filtered['mmkpts0']) >= 4:
-                # Use the existing homography from RANSAC
-                H = match_filtered['H']
-
-                # Convert to full frame coordinates
-                frame_keypoints_cropped = match_filtered['mmkpts0']
-                frame_keypoints_full = frame_keypoints_cropped.copy()
-                frame_keypoints_full[:, 0] += x1
-                frame_keypoints_full[:, 1] += y1
-
-                # Compute homography for SPATEN logo
-                reference_keypoints = match_filtered['mmkpts1']
-                spaten_keypoints = map_budlight_to_spaten_coordinates(reference_keypoints, center_x, center_y)
-
-                emergency_H = compute_homography_from_keypoints(frame_keypoints_full, spaten_keypoints)
-
-                if emergency_H is not None:
-                    self.emergency_fallback_count += 1
-                    print(f"  ✅ EMERGENCY FALLBACK SUCCESS: Homography computed")
-                    return emergency_H
-
-            print(f"  ❌ EMERGENCY FALLBACK FAILED")
-            return None
-
-        except Exception as e:
-            print(f"  ❌ EMERGENCY FALLBACK ERROR: {e}")
-            return None
-
-    def get_homography_for_frame(self,
-                                frame: np.ndarray,
-                                logo_bbox: np.ndarray,
-                                person_masks: np.ndarray,
-                                log_timing: bool = True) -> Optional[np.ndarray]:
-        """
-        Get homography matrix for current frame with comprehensive fallback system.
-
-        Args:
-            frame: Current frame
-            logo_bbox: Logo bounding box [x1, y1, x2, y2]
-            person_masks: Person segmentation masks [H, W]
-            log_timing: Whether to log timing information
-
-        Returns:
-            Homography matrix for logo replacement or None if all methods fail
-        """
-        # Try primary hybrid tracking
-        frame_keypoints, reference_keypoints = self.process_frame(frame, logo_bbox, person_masks, log_timing)
-
-        if frame_keypoints is not None and reference_keypoints is not None:
-            # PRIMARY SUCCESS: Compute homography
-            spaten_keypoints = map_budlight_to_spaten_coordinates(reference_keypoints, center_x, center_y)
-            H = compute_homography_from_keypoints(frame_keypoints, spaten_keypoints)
-
-            if H is not None:
-                # Update fallback data
-                self.last_good_homography = H.copy()
-                self.last_good_keypoints = frame_keypoints.copy()
-                self.last_good_reference_keypoints = reference_keypoints.copy()
-                self.consecutive_failures = 0
-                self.emergency_fallback_active = False
-
-                if log_timing:
-                    print(f"  ✅ PRIMARY SUCCESS: Homography computed from {len(frame_keypoints)} keypoints")
-
-                return H
-
-        # PRIMARY FAILED: Try fallback systems
-        self.consecutive_failures += 1
-
-        if log_timing:
-            print(f"  ⚠️  PRIMARY FAILED: Consecutive failures = {self.consecutive_failures}")
-
-        # FALLBACK 1: Use last good homography (for minor tracking failures)
-        if self.last_good_homography is not None and self.consecutive_failures <= self.max_consecutive_failures:
-            self.fallback_usage_count += 1
-            if log_timing:
-                print(f"  🔄 FALLBACK 1: Using last good homography (usage #{self.fallback_usage_count})")
-            return self.last_good_homography.copy()
-
-        # FALLBACK 2: Emergency recalibration with 4-corner approach
-        if self.consecutive_failures > self.max_consecutive_failures:
-            self.emergency_fallback_active = True
-            emergency_H = self._compute_emergency_homography(frame, logo_bbox)
-
-            if emergency_H is not None:
-                # Update fallback data
-                self.last_good_homography = emergency_H.copy()
-                self.consecutive_failures = 0
-                return emergency_H
-
-        # FALLBACK 3: Last resort - use previous homography even if old
-        if self.last_good_homography is not None:
-            self.fallback_usage_count += 1
-            if log_timing:
-                print(f"  🆘 FALLBACK 3: Using old homography as last resort")
-            return self.last_good_homography.copy()
-
-        # COMPLETE FAILURE: No homography available
-        if log_timing:
-            print(f"  💀 COMPLETE FAILURE: No homography available")
-
+def track_keypoints_with_cotracker(frame: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Track keypoints using CoTracker3 online model with memory optimizations.
+    
+    Args:
+        frame: Current frame
+        
+    Returns:
+        Tracked keypoints [N, 2] in full frame coordinates or None if failed
+    """
+    global frame_buffer, cotracker_queries
+    
+    if not cotracker_initialized or cotracker_queries is None or cotracker_model is None:
         return None
+    
+    # Memory optimization: Use inference mode
+    with torch.inference_mode():
+        # Add new frame to buffer and remove oldest
+        frame_buffer.append(frame)
+        
+        # Memory optimization: Keep smaller buffer size
+        buffer_size = COTRACKER_FRAME_BUFFER_SIZE if REDUCE_FRAME_BUFFER_SIZE else (cotracker_model.step * 2)
+        frame_buffer = frame_buffer[-buffer_size:]
+        
+        # Prepare video chunk - use available frames
+        video_chunk_frames = frame_buffer[-min(len(frame_buffer), cotracker_model.step * 2):]
+        
+        # Resize frames to CoTracker resolution
+        video_chunk_resized = []
+        for frame_i in video_chunk_frames:
+            frame_resized = cv2.resize(frame_i, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
+            video_chunk_resized.append(frame_resized)
+        
+        # Convert to tensor [1, T, C, H, W]
+        video_chunk_tensor = torch.from_numpy(np.stack(video_chunk_resized)).float()
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        video_chunk_tensor = video_chunk_tensor.to(device)
+        
+        # Use mixed precision if enabled
+        if USE_MIXED_PRECISION and torch.cuda.is_available():
+            video_chunk_tensor = video_chunk_tensor.half()
+        
+        video_chunk_tensor = video_chunk_tensor.permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, 3, H, W]
+        
+        # Run CoTracker3 online inference
+        pred_tracks, pred_visibility = cotracker_model(
+            video_chunk=video_chunk_tensor,
+            is_first_step=False,
+            grid_size=0,
+            queries=cotracker_queries,
+            add_support_grid=False
+        )
+        
+        # Get tracks for the last frame (most recent)
+        last_frame_tracks = pred_tracks[0, -1].cpu().numpy()  # [N, 2]
+        last_frame_visibility = pred_visibility[0, -1].cpu().numpy()  # [N]
+        
+        # Scale from CoTracker resolution to full frame resolution
+        frame_height, frame_width = frame.shape[:2]
+        last_frame_tracks[:, 0] *= frame_width / COTRACKER_INPUT_RESOLUTION[1]   # Scale x
+        last_frame_tracks[:, 1] *= frame_height / COTRACKER_INPUT_RESOLUTION[0]  # Scale y
+        
+        print(f"CoTracker3: Tracked {len(last_frame_tracks)} keypoints")
+        
+        # Memory cleanup
+        del video_chunk_tensor, pred_tracks, pred_visibility
+        clear_gpu_memory()
+        
+        return last_frame_tracks
 
-    def get_performance_stats(self) -> dict:
-        """Get performance statistics."""
-        stats = {
-            'roma_calls': len(self.roma_times),
-            'cotracker_calls': len(self.cotracker_times),
-            'roma_avg_time': np.mean(self.roma_times) if self.roma_times else 0,
-            'cotracker_avg_time': np.mean(self.cotracker_times) if self.cotracker_times else 0,
-            'total_frames': self.frame_counter,
-            'fallback_usage_count': self.fallback_usage_count,
-            'emergency_fallback_count': self.emergency_fallback_count,
-            'consecutive_failures': self.consecutive_failures,
-            'emergency_fallback_active': self.emergency_fallback_active,
-            'success_rate': (self.frame_counter - self.fallback_usage_count) / self.frame_counter if self.frame_counter > 0 else 0
-        }
-        return stats
+def filter_occluded_keypoints(keypoints: np.ndarray,
+                             person_masks: np.ndarray,
+                             reference_keypoints: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Filter keypoints that are occluded by people, but keep tracking them.
+    
+    Args:
+        keypoints: Keypoints [N, 2] in full frame coordinates
+        person_masks: Person segmentation masks [H, W]
+        reference_keypoints: Reference keypoints [N, 2] in logo coordinates
+        
+    Returns:
+        Tuple of (visible_keypoints, visible_reference_keypoints) for homography computation
+    """
+    if len(keypoints) == 0 or len(reference_keypoints) == 0:
+        return keypoints, reference_keypoints
+    
+    # Check which keypoints are not occluded
+    visible_mask = np.ones(len(keypoints), dtype=bool)
+    
+    for i, (x, y) in enumerate(keypoints):
+        # Check if keypoint is within frame bounds
+        if x < 0 or y < 0 or x >= person_masks.shape[1] or y >= person_masks.shape[0]:
+            visible_mask[i] = False
+            continue
+        
+        # Check if keypoint is occluded by person
+        if person_masks[int(y), int(x)] > 0:
+            visible_mask[i] = False
+    
+    # Filter keypoints for homography computation (only visible ones)
+    visible_keypoints = keypoints[visible_mask]
+    visible_reference_keypoints = reference_keypoints[visible_mask]
+    
+    print(f"Occlusion filter: {len(visible_keypoints)}/{len(keypoints)} keypoints visible")
+    return visible_keypoints, visible_reference_keypoints
+
+def get_keypoints_for_frame(frame: np.ndarray,
+                           logo_bbox: np.ndarray,
+                           person_masks: np.ndarray,
+                           roma_model,
+                           preprocessing_conf: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Get keypoints for current frame using hybrid tracking approach.
+    
+    Args:
+        frame: Current frame
+        logo_bbox: Logo bounding box [x1, y1, x2, y2]
+        person_masks: Person segmentation masks [H, W]
+        roma_model: ROMA model
+        preprocessing_conf: Preprocessing configuration
+        
+    Returns:
+        Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
+    """
+    global frame_counter, current_keypoints, reference_keypoints, cotracker_initialized
+    
+    frame_counter += 1
+    is_recalibration_frame = frame_counter % MATCH_EVERY_N_FRAMES == 1
+    
+    print(f"Frame {frame_counter}: {'ROMA recalibration' if is_recalibration_frame else 'CoTracker tracking'}")
+    
+    if is_recalibration_frame or not cotracker_initialized:
+        # Recalibration phase: Use ROMA to detect keypoints
+        frame_kp, ref_kp = detect_keypoints_with_roma(frame, logo_bbox, roma_model, preprocessing_conf)
+        
+        if frame_kp is not None and ref_kp is not None:
+            # Filter occluded keypoints
+            frame_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(frame_kp, person_masks, ref_kp)
+            
+            if len(frame_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
+                # Update tracking state
+                current_keypoints = frame_kp
+                reference_keypoints = ref_kp
+                
+                # Initialize CoTracker3 online for next frames
+                initialize_cotracker_online(frame, frame_kp)
+                
+                print(f"Frame {frame_counter}: ROMA success with {len(frame_kp_filtered)} visible keypoints")
+                return frame_kp_filtered, ref_kp_filtered
+            else:
+                print(f"Frame {frame_counter}: Insufficient visible keypoints after filtering ({len(frame_kp_filtered)})")
+                return None, None
+        else:
+            print(f"Frame {frame_counter}: ROMA detection failed")
+            return None, None
+    
+    else:
+        # Tracking phase: Use CoTracker3 online to track existing keypoints
+        tracked_kp = track_keypoints_with_cotracker(frame)
+        
+        if tracked_kp is not None and reference_keypoints is not None:
+            # Filter occluded keypoints for homography computation
+            tracked_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(tracked_kp, person_masks, reference_keypoints)
+            
+            if len(tracked_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
+                print(f"Frame {frame_counter}: CoTracker success with {len(tracked_kp_filtered)} visible keypoints")
+                return tracked_kp_filtered, ref_kp_filtered
+            else:
+                print(f"Frame {frame_counter}: Insufficient visible keypoints after tracking ({len(tracked_kp_filtered)})")
+                # Reset for immediate recalibration
+                cotracker_initialized = False
+                frame_counter = MATCH_EVERY_N_FRAMES  # Force recalibration
+                return None, None
+        else:
+            print(f"Frame {frame_counter}: CoTracker tracking failed")
+            # Reset for immediate recalibration
+            cotracker_initialized = False
+            frame_counter = MATCH_EVERY_N_FRAMES  # Force recalibration
+            return None, None
 
 
 def compute_homography_from_keypoints(frame_keypoints: np.ndarray,
@@ -1406,12 +1160,7 @@ else:
 
 # Create the hybrid tracker
 print("Creating Hybrid Logo Tracker...")
-hybrid_tracker = HybridLogoTracker(
-    roma_model=model,
-    roma_preprocessing_conf=preprocessing_conf,
-    budlight_reference=budlight_downsampled,
-    device="cuda" if torch.cuda.is_available() else "cpu"
-)
+# Remove the HybridLogoTracker instantiation since we're using simple functions now
 
 # Create the complete pipeline
 logo_replacement_pipeline = create_logo_replacement_pipeline()
@@ -1471,8 +1220,6 @@ print(f"Using hybrid tracking: ROMA every {MATCH_EVERY_N_FRAMES} frames, CoTrack
 
 # Performance tracking
 total_times = []
-roma_frame_count = 0
-cotracker_frame_count = 0
 
 while video_stream.isOpened():
     start_time_frame: float = time.time()
@@ -1507,35 +1254,36 @@ while video_stream.isOpened():
 
     if boxes is not None and boxes.shape[0] > 0:
         # Extract bounding box - handle both tensor and numpy array cases
-        try:
-            if hasattr(boxes, 'cpu') and callable(getattr(boxes, 'cpu', None)):
-                # It's a tensor
-                budlight_bbox = boxes.cpu().numpy().astype(int).squeeze()
-            else:
-                # It's already a numpy array
-                budlight_bbox = np.array(boxes).astype(int).squeeze()
-        except Exception as box_error:
-            print(f"Error processing bounding box: {box_error}")
+        if hasattr(boxes, 'cpu') and callable(getattr(boxes, 'cpu', None)):
+            # It's a tensor
+            budlight_bbox = boxes.cpu().numpy().astype(int).squeeze()
+        else:
+            # It's already a numpy array
             budlight_bbox = np.array(boxes).astype(int).squeeze()
 
         print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
 
-        try:
-            # Get person masks for occlusion filtering
-            person_mask = get_person_masks(
-                frame_rgb,
-                person_seg_model,
-                confidence_threshold=0.5,
-                log_timing=False
-            )
+        # Get person masks for occlusion filtering
+        person_mask = get_person_masks(
+            frame_rgb,
+            person_seg_model,
+            confidence_threshold=0.5,
+            log_timing=False
+        )
 
-            # 🔥 NEW: Use robust fallback system to get homography
-            H_spaten = hybrid_tracker.get_homography_for_frame(
-                frame_rgb,
-                budlight_bbox,
-                person_mask,
-                log_timing=True
-            )
+        # Get keypoints using hybrid tracking approach
+        frame_keypoints, reference_keypoints = get_keypoints_for_frame(
+            frame_rgb,
+            budlight_bbox,
+            person_mask,
+            model,
+            preprocessing_conf
+        )
+
+        if frame_keypoints is not None and reference_keypoints is not None:
+            # Compute homography for logo replacement
+            spaten_keypoints = map_budlight_to_spaten_coordinates(reference_keypoints, center_x, center_y)
+            H_spaten = compute_homography_from_keypoints(frame_keypoints, spaten_keypoints)
 
             if H_spaten is not None:
                 # Apply logo replacement using computed homography
@@ -1583,30 +1331,11 @@ while video_stream.isOpened():
                     log_timing=False
                 )
 
-                # Update performance counters
-                if hybrid_tracker.frame_counter % MATCH_EVERY_N_FRAMES == 1 or not hybrid_tracker.tracking_active:
-                    roma_frame_count += 1
-                else:
-                    cotracker_frame_count += 1
-
-                # Determine success type for logging
-                if hybrid_tracker.consecutive_failures > 0:
-                    success_type = "FALLBACK"
-                elif hybrid_tracker.emergency_fallback_active:
-                    success_type = "EMERGENCY"
-                else:
-                    success_type = "PRIMARY"
-
-                print(f"Frame {current_frame_number}: ✅ {success_type} logo replacement successful")
-
+                print(f"Frame {current_frame_number}: ✅ Logo replacement successful")
             else:
-                print(f"Frame {current_frame_number}: ❌ ALL FALLBACK METHODS FAILED - Logo will remain original")
-                # Even complete failure - we still process the frame to avoid crashes
-                result_frame = frame_rgb  # Use original frame
-
-        except Exception as e:
-            print(f"Frame {current_frame_number}: ❌ Exception in logo replacement: {e}")
-            result_frame = frame_rgb  # Use original frame if replacement fails
+                print(f"Frame {current_frame_number}: ❌ Homography computation failed")
+        else:
+            print(f"Frame {current_frame_number}: ❌ Keypoint detection/tracking failed")
     else:
         print(f"Frame {current_frame_number}: No Budlight logo detected")
 
@@ -1646,53 +1375,13 @@ print("\n" + "="*50)
 print("HYBRID TRACKING PERFORMANCE STATISTICS")
 print("="*50)
 
-stats = hybrid_tracker.get_performance_stats()
-print(f"Total frames processed: {stats['total_frames']}")
-print(f"ROMA recalibrations: {stats['roma_calls']} ({roma_frame_count} frames)")
-print(f"CoTracker trackings: {stats['cotracker_calls']} ({cotracker_frame_count} frames)")
-print(f"Average ROMA time: {stats['roma_avg_time']:.3f}s")
-print(f"Average CoTracker time: {stats['cotracker_avg_time']:.3f}s")
-
-print(f"\n📊 FALLBACK SYSTEM STATISTICS:")
-print(f"Primary success rate: {stats['success_rate']:.1%}")
-print(f"Fallback usage count: {stats['fallback_usage_count']}")
-print(f"Emergency fallback count: {stats['emergency_fallback_count']}")
-print(f"Current consecutive failures: {stats['consecutive_failures']}")
-print(f"Emergency fallback active: {stats['emergency_fallback_active']}")
-
 if total_times:
     avg_frame_time = np.mean(total_times)
     avg_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
-    print(f"\n⏱️  OVERALL PERFORMANCE:")
-    print(f"Average total frame time: {avg_frame_time:.3f}s")
+    print(f"Average frame time: {avg_frame_time:.3f}s")
     print(f"Average FPS: {avg_fps:.1f}")
+    print(f"Total frames processed: {len(total_times)}")
+    print(f"ROMA recalibrations: {len(total_times) // MATCH_EVERY_N_FRAMES + 1}")
+    print(f"CoTracker trackings: {len(total_times) - (len(total_times) // MATCH_EVERY_N_FRAMES + 1)}")
 
-print(f"\n🚀 OPTIMIZATION IMPACT:")
-print(f"ROMA frequency: 1 every {MATCH_EVERY_N_FRAMES} frames ({100/MATCH_EVERY_N_FRAMES:.1f}%)")
-print(f"CoTracker frequency: {MATCH_EVERY_N_FRAMES-1} every {MATCH_EVERY_N_FRAMES} frames ({100*(MATCH_EVERY_N_FRAMES-1)/MATCH_EVERY_N_FRAMES:.1f}%)")
-
-# Calculate continuity metrics
-total_processed = stats['total_frames']
-primary_success = total_processed - stats['fallback_usage_count']
-fallback_success = stats['fallback_usage_count'] - stats['emergency_fallback_count']
-emergency_success = stats['emergency_fallback_count']
-complete_failures = total_processed - (primary_success + fallback_success + emergency_success)
-
-print(f"\n🎯 LOGO REPLACEMENT CONTINUITY:")
-print(f"Primary success: {primary_success}/{total_processed} ({100*primary_success/total_processed:.1f}%)")
-print(f"Fallback success: {fallback_success}/{total_processed} ({100*fallback_success/total_processed:.1f}%)")
-print(f"Emergency success: {emergency_success}/{total_processed} ({100*emergency_success/total_processed:.1f}%)")
-print(f"Complete failures: {complete_failures}/{total_processed} ({100*complete_failures/total_processed:.1f}%)")
-
-continuity_rate = (total_processed - complete_failures) / total_processed if total_processed > 0 else 0
-print(f"\n✅ OVERALL CONTINUITY RATE: {continuity_rate:.1%}")
-if continuity_rate >= 0.99:
-    print("🎉 EXCELLENT: Logo replacement is nearly seamless!")
-elif continuity_rate >= 0.95:
-    print("✅ GOOD: Logo replacement is mostly continuous")
-elif continuity_rate >= 0.90:
-    print("⚠️  ACCEPTABLE: Some logo flickering may be noticeable")
-else:
-    print("❌ POOR: Significant logo flickering detected")
-
-print("Video processing completed with hybrid tracking and fallback system!")
+print("Video processing completed with simplified hybrid tracking!")
