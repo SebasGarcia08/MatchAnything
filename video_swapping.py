@@ -33,9 +33,9 @@ from imcui.ui.utils import (
 )
 
 # Hybrid tracking configuration
-MATCH_EVERY_N_FRAMES = 160
-MAX_KP_TO_TRACK = 50
-MIN_KP_FOR_HOMOGRAPHY = 100  # Increased from default
+MATCH_EVERY_N_FRAMES = 320
+MAX_KP_TO_TRACK = 200  # Reduced from 400 for better stability
+MIN_KP_FOR_HOMOGRAPHY = 40  # Reduced from 100 for more flexibility
 ROMA_CONFIDENCE_THRESHOLD = 0.05  # Increased from 0.02
 COTRACKER_INPUT_RESOLUTION = (384, 512)  # H, W for CoTracker3
 
@@ -46,6 +46,14 @@ COTRACKER_FRAME_BUFFER_SIZE = 16  # Reduced from 32 (model.step * 2)
 PROCESS_RESOLUTION_SCALE = 0.8  # Process at 80% resolution to save memory
 UNLOAD_MODELS_BETWEEN_FRAMES = False  # Extreme memory saving (slower)
 ENABLE_MEMORY_MONITORING = True  # Monitor GPU memory usage
+COTRACKER_MIXED_PRECISION = False  # Disable mixed precision for CoTracker3 (compatibility issue)
+
+# Stability optimization settings
+ENABLE_TEMPORAL_SMOOTHING = True  # Enable homography smoothing
+HOMOGRAPHY_SMOOTHING_ALPHA = 0.7  # Smoothing factor (0.0 = no smoothing, 1.0 = full smoothing)
+KEYPOINT_QUALITY_THRESHOLD = 0.05  # Filter out low-quality keypoints
+HOMOGRAPHY_VALIDATION_THRESHOLD = 0.3  # Validate homography stability
+MAX_HOMOGRAPHY_CHANGE = 0.3  # Maximum allowed homography change between frames
 
 # Global variables for tracking state
 cotracker_model = None
@@ -55,6 +63,11 @@ frame_buffer = []
 current_keypoints = None
 reference_keypoints = None
 frame_counter = 0
+
+# Temporal smoothing variables
+previous_homography = None
+homography_history = []
+MAX_HISTORY_SIZE = 10
 
 def get_gpu_memory_usage():
     """Get current GPU memory usage in MB."""
@@ -96,43 +109,43 @@ def initialize_cotracker():
             cotracker_model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online")
             device = "cuda" if torch.cuda.is_available() else "cpu"
             cotracker_model = cotracker_model.to(device)
-            
-            # Use mixed precision for memory savings
-            if USE_MIXED_PRECISION and torch.cuda.is_available():
-                cotracker_model = cotracker_model.half()  # Convert to half precision
-                print("CoTracker3 converted to half precision for memory savings")
-            
+
+            # Note: CoTracker3 kept in full precision due to compatibility issues
+            # Mixed precision disabled for CoTracker3 to avoid dtype mismatches
+            if not COTRACKER_MIXED_PRECISION:
+                print("CoTracker3 kept in full precision for stability")
+
         print(f"CoTracker3 online model loaded successfully! Step size: {cotracker_model.step}")
         clear_gpu_memory()  # Clear memory after loading
         log_memory_usage("After CoTracker loading")
 
-def detect_keypoints_with_roma(frame: np.ndarray, 
+def detect_keypoints_with_roma(frame: np.ndarray,
                               logo_bbox: np.ndarray,
                               roma_model,
                               preprocessing_conf: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Detect keypoints using MatchAnything ROMA model with memory optimizations.
-    
+    Detect keypoints using MatchAnything ROMA model with memory optimizations and quality filtering.
+
     Args:
         frame: Current frame
         logo_bbox: Logo bounding box [x1, y1, x2, y2]
         roma_model: ROMA model
         preprocessing_conf: Preprocessing configuration
-        
+
     Returns:
         Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
     """
     # Memory optimization: Use inference mode for all operations
     with torch.inference_mode():
         log_memory_usage("Before ROMA processing")
-        
+
         # Expand bounding box
         img_height, img_width = frame.shape[:2]
         x1, y1, x2, y2 = expand_box(logo_bbox, 0.1, img_width, img_height)
-        
+
         # Crop logo region
         physical_logo_cropped = frame[y1:y2, x1:x2]
-        
+
         # Memory optimization: Reduce processing resolution if needed
         if PROCESS_RESOLUTION_SCALE < 1.0:
             new_h = int(physical_logo_cropped.shape[0] * PROCESS_RESOLUTION_SCALE)
@@ -142,108 +155,181 @@ def detect_keypoints_with_roma(frame: np.ndarray,
             scale_factor = 1.0 / PROCESS_RESOLUTION_SCALE
         else:
             scale_factor = 1.0
-        
-        # Run ROMA matching
+
+        # Run ROMA matching with more keypoints initially for better filtering
         match_pred = run_matching_simple(
             roma_model,
             physical_logo_cropped,
             budlight_downsampled,
             preprocessing_conf=preprocessing_conf,
             match_threshold=ROMA_CONFIDENCE_THRESHOLD,
-            extract_max_keypoints=MAX_KP_TO_TRACK,
+            extract_max_keypoints=MAX_KP_TO_TRACK * 3,  # Get 3x more for quality filtering
             log_timing=False
         )
-        
+
         # Filter matches with RANSAC
         match_filtered = filter_matches_ransac(match_pred, log_timing=False)
-        
+
         if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
             print(f"ROMA: Insufficient matches ({len(match_filtered.get('mmkpts0', []))}) for reliable tracking")
             return None, None
-        
+
         # Get keypoints in cropped coordinates
         frame_keypoints_cropped = match_filtered['mmkpts0']  # [N, 2]
         reference_keypoints = match_filtered['mmkpts1']  # [N, 2]
-        
+        confidences = match_filtered['mmconf']  # [N]
+
+        # Apply quality filtering based on confidence scores
+        frame_keypoints_quality, reference_keypoints_quality = filter_keypoints_by_quality(
+            frame_keypoints_cropped, reference_keypoints, confidences
+        )
+
+        # Check if we have enough high-quality keypoints
+        if len(frame_keypoints_quality) < MIN_KP_FOR_HOMOGRAPHY:
+            print(f"ROMA: Insufficient high-quality keypoints ({len(frame_keypoints_quality)}) after quality filtering")
+            return None, None
+
         # Scale keypoints back if resolution was reduced
         if scale_factor != 1.0:
-            frame_keypoints_cropped = frame_keypoints_cropped * scale_factor
-        
+            frame_keypoints_quality = frame_keypoints_quality * scale_factor
+
         # Convert to full frame coordinates
-        frame_keypoints_full = frame_keypoints_cropped.copy()
+        frame_keypoints_full = frame_keypoints_quality.copy()
         frame_keypoints_full[:, 0] += x1  # Add x offset
         frame_keypoints_full[:, 1] += y1  # Add y offset
-        
-        print(f"ROMA: Detected {len(frame_keypoints_full)} keypoints")
-        
+
+        # Ensure spatial distribution of keypoints for better stability
+        frame_keypoints_distributed, reference_keypoints_distributed = ensure_spatial_distribution(
+            frame_keypoints_full, reference_keypoints_quality
+        )
+
+        print(f"ROMA: Detected {len(frame_keypoints_distributed)} high-quality, well-distributed keypoints")
+
         # Memory cleanup
         del match_pred, match_filtered, physical_logo_cropped
         clear_gpu_memory()
         log_memory_usage("After ROMA processing")
-        
-        return frame_keypoints_full, reference_keypoints
 
-def initialize_cotracker_online(initial_frame: np.ndarray, 
+        return frame_keypoints_distributed, reference_keypoints_distributed
+
+def ensure_spatial_distribution(keypoints: np.ndarray,
+                               reference_keypoints: np.ndarray,
+                               grid_size: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Ensure keypoints are spatially distributed across the logo region for stable homography.
+
+    Args:
+        keypoints: Frame keypoints [N, 2]
+        reference_keypoints: Reference keypoints [N, 2]
+        grid_size: Number of grid cells per dimension
+
+    Returns:
+        Tuple of (distributed_keypoints, distributed_reference_keypoints)
+    """
+    if len(keypoints) <= MAX_KP_TO_TRACK:
+        return keypoints, reference_keypoints
+
+    # Calculate bounding box of keypoints
+    min_x, min_y = np.min(keypoints, axis=0)
+    max_x, max_y = np.max(keypoints, axis=0)
+
+    # Create grid
+    grid_width = (max_x - min_x) / grid_size
+    grid_height = (max_y - min_y) / grid_size
+
+    if grid_width == 0 or grid_height == 0:
+        return keypoints[:MAX_KP_TO_TRACK], reference_keypoints[:MAX_KP_TO_TRACK]
+
+    # Select keypoints from each grid cell
+    selected_indices = []
+    keypoints_per_cell = max(1, MAX_KP_TO_TRACK // (grid_size * grid_size))
+
+    for i in range(grid_size):
+        for j in range(grid_size):
+            # Define grid cell boundaries
+            cell_min_x = min_x + i * grid_width
+            cell_max_x = min_x + (i + 1) * grid_width
+            cell_min_y = min_y + j * grid_height
+            cell_max_y = min_y + (j + 1) * grid_height
+
+            # Find keypoints in this cell
+            in_cell = ((keypoints[:, 0] >= cell_min_x) & (keypoints[:, 0] < cell_max_x) &
+                      (keypoints[:, 1] >= cell_min_y) & (keypoints[:, 1] < cell_max_y))
+
+            cell_indices = np.where(in_cell)[0]
+
+            # Select best keypoints from this cell
+            if len(cell_indices) > 0:
+                # Take first keypoints_per_cell keypoints (they're already sorted by quality)
+                selected_indices.extend(cell_indices[:keypoints_per_cell])
+
+    # If we don't have enough keypoints, add the remaining best ones
+    if len(selected_indices) < MAX_KP_TO_TRACK:
+        remaining_indices = [i for i in range(len(keypoints)) if i not in selected_indices]
+        needed = MAX_KP_TO_TRACK - len(selected_indices)
+        selected_indices.extend(remaining_indices[:needed])
+
+    selected_indices = selected_indices[:MAX_KP_TO_TRACK]
+
+    if len(selected_indices) == 0:
+        return keypoints[:MAX_KP_TO_TRACK], reference_keypoints[:MAX_KP_TO_TRACK]
+
+    distributed_keypoints = keypoints[selected_indices]
+    distributed_reference_keypoints = reference_keypoints[selected_indices]
+
+    print(f"Spatial distribution: {len(distributed_keypoints)} keypoints selected from {grid_size}x{grid_size} grid")
+    return distributed_keypoints, distributed_reference_keypoints
+
+def initialize_cotracker_online(initial_frame: np.ndarray,
                                initial_keypoints: np.ndarray) -> bool:
     """
     Initialize CoTracker3 online processing with memory optimizations.
-    
+
     Args:
         initial_frame: Initial frame for CoTracker3
         initial_keypoints: Initial keypoints [N, 2] in full frame coordinates
-        
+
     Returns:
         True if initialization successful, False otherwise
     """
     global cotracker_initialized, cotracker_queries, frame_buffer
-    
+
     # Memory optimization: Use inference mode
     with torch.inference_mode():
         # Ensure CoTracker model is loaded
         initialize_cotracker()
-        
+
         if cotracker_model is None:
             return False
-        
+
         # Prepare frame tensor - CoTracker3 online expects [B, T, C, H, W]
         frame_resized = cv2.resize(initial_frame, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
         frame_tensor = torch.from_numpy(frame_resized).float()
-        
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         frame_tensor = frame_tensor.to(device)
-        
-        # Use mixed precision if enabled
-        if USE_MIXED_PRECISION and torch.cuda.is_available():
-            frame_tensor = frame_tensor.half()
-        
+
+        # Keep in full precision for CoTracker3 compatibility
         frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-        
+
         # Scale keypoints to CoTracker resolution
         frame_height, frame_width = initial_frame.shape[:2]
         scaled_keypoints = initial_keypoints.copy()
         scaled_keypoints[:, 0] *= COTRACKER_INPUT_RESOLUTION[1] / frame_width   # Scale x
         scaled_keypoints[:, 1] *= COTRACKER_INPUT_RESOLUTION[0] / frame_height  # Scale y
-        
+
         # Prepare queries tensor: [1, N, 3] where each point is [t, x, y]
         num_points = len(scaled_keypoints)
         queries = torch.zeros(1, num_points, 3).to(device)
-        
-        # Use mixed precision if enabled
-        if USE_MIXED_PRECISION and torch.cuda.is_available():
-            queries = queries.half()
-        
+
+        # Keep in full precision for CoTracker3 compatibility
         queries[0, :, 0] = 0  # Time index (first frame)
         queries[0, :, 1] = torch.from_numpy(scaled_keypoints[:, 0]).float().to(device)
         queries[0, :, 2] = torch.from_numpy(scaled_keypoints[:, 1]).float().to(device)
-        
-        # Use mixed precision if enabled
-        if USE_MIXED_PRECISION and torch.cuda.is_available():
-            queries[0, :, 1] = queries[0, :, 1].half()
-            queries[0, :, 2] = queries[0, :, 2].half()
-        
+
         # Store queries for later use
         cotracker_queries = queries
-        
+
         # Initialize CoTracker3 online processing
         cotracker_model(
             video_chunk=frame_tensor,
@@ -252,65 +338,62 @@ def initialize_cotracker_online(initial_frame: np.ndarray,
             queries=queries,
             add_support_grid=False
         )
-        
+
         # Memory optimization: Use smaller frame buffer
         buffer_size = COTRACKER_FRAME_BUFFER_SIZE if REDUCE_FRAME_BUFFER_SIZE else (cotracker_model.step * 2)
         frame_buffer = [initial_frame] * buffer_size
-        
+
         cotracker_initialized = True
         print(f"CoTracker3 online initialized with {num_points} keypoints (buffer size: {buffer_size})")
-        
+
         # Memory cleanup
         del frame_tensor, queries
         clear_gpu_memory()
-        
+
         return True
 
 def track_keypoints_with_cotracker(frame: np.ndarray) -> Optional[np.ndarray]:
     """
     Track keypoints using CoTracker3 online model with memory optimizations.
-    
+
     Args:
         frame: Current frame
-        
+
     Returns:
         Tracked keypoints [N, 2] in full frame coordinates or None if failed
     """
     global frame_buffer, cotracker_queries
-    
+
     if not cotracker_initialized or cotracker_queries is None or cotracker_model is None:
         return None
-    
+
     # Memory optimization: Use inference mode
     with torch.inference_mode():
         # Add new frame to buffer and remove oldest
         frame_buffer.append(frame)
-        
+
         # Memory optimization: Keep smaller buffer size
         buffer_size = COTRACKER_FRAME_BUFFER_SIZE if REDUCE_FRAME_BUFFER_SIZE else (cotracker_model.step * 2)
         frame_buffer = frame_buffer[-buffer_size:]
-        
+
         # Prepare video chunk - use available frames
         video_chunk_frames = frame_buffer[-min(len(frame_buffer), cotracker_model.step * 2):]
-        
+
         # Resize frames to CoTracker resolution
         video_chunk_resized = []
         for frame_i in video_chunk_frames:
             frame_resized = cv2.resize(frame_i, COTRACKER_INPUT_RESOLUTION[::-1])  # (W, H)
             video_chunk_resized.append(frame_resized)
-        
+
         # Convert to tensor [1, T, C, H, W]
         video_chunk_tensor = torch.from_numpy(np.stack(video_chunk_resized)).float()
-        
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         video_chunk_tensor = video_chunk_tensor.to(device)
-        
-        # Use mixed precision if enabled
-        if USE_MIXED_PRECISION and torch.cuda.is_available():
-            video_chunk_tensor = video_chunk_tensor.half()
-        
+
+        # Keep in full precision for CoTracker3 compatibility
         video_chunk_tensor = video_chunk_tensor.permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, 3, H, W]
-        
+
         # Run CoTracker3 online inference
         pred_tracks, pred_visibility = cotracker_model(
             video_chunk=video_chunk_tensor,
@@ -319,22 +402,22 @@ def track_keypoints_with_cotracker(frame: np.ndarray) -> Optional[np.ndarray]:
             queries=cotracker_queries,
             add_support_grid=False
         )
-        
+
         # Get tracks for the last frame (most recent)
         last_frame_tracks = pred_tracks[0, -1].cpu().numpy()  # [N, 2]
         last_frame_visibility = pred_visibility[0, -1].cpu().numpy()  # [N]
-        
+
         # Scale from CoTracker resolution to full frame resolution
         frame_height, frame_width = frame.shape[:2]
         last_frame_tracks[:, 0] *= frame_width / COTRACKER_INPUT_RESOLUTION[1]   # Scale x
         last_frame_tracks[:, 1] *= frame_height / COTRACKER_INPUT_RESOLUTION[0]  # Scale y
-        
+
         print(f"CoTracker3: Tracked {len(last_frame_tracks)} keypoints")
-        
+
         # Memory cleanup
         del video_chunk_tensor, pred_tracks, pred_visibility
         clear_gpu_memory()
-        
+
         return last_frame_tracks
 
 def filter_occluded_keypoints(keypoints: np.ndarray,
@@ -342,35 +425,43 @@ def filter_occluded_keypoints(keypoints: np.ndarray,
                              reference_keypoints: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Filter keypoints that are occluded by people, but keep tracking them.
-    
+
     Args:
         keypoints: Keypoints [N, 2] in full frame coordinates
         person_masks: Person segmentation masks [H, W]
         reference_keypoints: Reference keypoints [N, 2] in logo coordinates
-        
+
     Returns:
         Tuple of (visible_keypoints, visible_reference_keypoints) for homography computation
     """
     if len(keypoints) == 0 or len(reference_keypoints) == 0:
         return keypoints, reference_keypoints
-    
+
+    # Handle size mismatch between tracked and reference keypoints
+    min_size = min(len(keypoints), len(reference_keypoints))
+    if len(keypoints) != len(reference_keypoints):
+        print(f"Warning: Keypoint size mismatch - tracked: {len(keypoints)}, reference: {len(reference_keypoints)}")
+        print(f"Using first {min_size} keypoints from both arrays")
+        keypoints = keypoints[:min_size]
+        reference_keypoints = reference_keypoints[:min_size]
+
     # Check which keypoints are not occluded
     visible_mask = np.ones(len(keypoints), dtype=bool)
-    
+
     for i, (x, y) in enumerate(keypoints):
         # Check if keypoint is within frame bounds
         if x < 0 or y < 0 or x >= person_masks.shape[1] or y >= person_masks.shape[0]:
             visible_mask[i] = False
             continue
-        
+
         # Check if keypoint is occluded by person
         if person_masks[int(y), int(x)] > 0:
             visible_mask[i] = False
-    
+
     # Filter keypoints for homography computation (only visible ones)
     visible_keypoints = keypoints[visible_mask]
     visible_reference_keypoints = reference_keypoints[visible_mask]
-    
+
     print(f"Occlusion filter: {len(visible_keypoints)}/{len(keypoints)} keypoints visible")
     return visible_keypoints, visible_reference_keypoints
 
@@ -381,40 +472,40 @@ def get_keypoints_for_frame(frame: np.ndarray,
                            preprocessing_conf: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Get keypoints for current frame using hybrid tracking approach.
-    
+
     Args:
         frame: Current frame
         logo_bbox: Logo bounding box [x1, y1, x2, y2]
         person_masks: Person segmentation masks [H, W]
         roma_model: ROMA model
         preprocessing_conf: Preprocessing configuration
-        
+
     Returns:
         Tuple of (frame_keypoints, reference_keypoints) or (None, None) if failed
     """
     global frame_counter, current_keypoints, reference_keypoints, cotracker_initialized
-    
+
     frame_counter += 1
     is_recalibration_frame = frame_counter % MATCH_EVERY_N_FRAMES == 1
-    
+
     print(f"Frame {frame_counter}: {'ROMA recalibration' if is_recalibration_frame else 'CoTracker tracking'}")
-    
+
     if is_recalibration_frame or not cotracker_initialized:
         # Recalibration phase: Use ROMA to detect keypoints
         frame_kp, ref_kp = detect_keypoints_with_roma(frame, logo_bbox, roma_model, preprocessing_conf)
-        
+
         if frame_kp is not None and ref_kp is not None:
             # Filter occluded keypoints
             frame_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(frame_kp, person_masks, ref_kp)
-            
+
             if len(frame_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
-                # Update tracking state
-                current_keypoints = frame_kp
-                reference_keypoints = ref_kp
-                
-                # Initialize CoTracker3 online for next frames
+                # Update tracking state - store original unfiltered keypoints
+                current_keypoints = frame_kp.copy()  # Store all keypoints for tracking
+                reference_keypoints = ref_kp.copy()  # Store all reference keypoints
+
+                # Initialize CoTracker3 online for next frames with ALL keypoints
                 initialize_cotracker_online(frame, frame_kp)
-                
+
                 print(f"Frame {frame_counter}: ROMA success with {len(frame_kp_filtered)} visible keypoints")
                 return frame_kp_filtered, ref_kp_filtered
             else:
@@ -423,15 +514,19 @@ def get_keypoints_for_frame(frame: np.ndarray,
         else:
             print(f"Frame {frame_counter}: ROMA detection failed")
             return None, None
-    
+
     else:
         # Tracking phase: Use CoTracker3 online to track existing keypoints
         tracked_kp = track_keypoints_with_cotracker(frame)
-        
+
         if tracked_kp is not None and reference_keypoints is not None:
+            # Make sure we have consistent sizes for filtering
+            # Use the originPrimero usá estal reference_keypoints (not modified by previous filtering)
+            ref_kp_for_filtering = reference_keypoints.copy()
+
             # Filter occluded keypoints for homography computation
-            tracked_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(tracked_kp, person_masks, reference_keypoints)
-            
+            tracked_kp_filtered, ref_kp_filtered = filter_occluded_keypoints(tracked_kp, person_masks, ref_kp_for_filtering)
+
             if len(tracked_kp_filtered) >= MIN_KP_FOR_HOMOGRAPHY:
                 print(f"Frame {frame_counter}: CoTracker success with {len(tracked_kp_filtered)} visible keypoints")
                 return tracked_kp_filtered, ref_kp_filtered
@@ -449,14 +544,144 @@ def get_keypoints_for_frame(frame: np.ndarray,
             return None, None
 
 
+def filter_keypoints_by_quality(keypoints: np.ndarray,
+                                reference_keypoints: np.ndarray,
+                                confidences: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Filter keypoints based on quality/confidence scores.
+
+    Args:
+        keypoints: Frame keypoints [N, 2]
+        reference_keypoints: Reference keypoints [N, 2]
+        confidences: Confidence scores [N]
+
+    Returns:
+        Tuple of (filtered_keypoints, filtered_reference_keypoints)
+    """
+    if len(keypoints) == 0 or len(confidences) == 0:
+        return keypoints, reference_keypoints
+
+    # Filter by confidence threshold
+    quality_mask = confidences > KEYPOINT_QUALITY_THRESHOLD
+
+    # Take top keypoints if we have too many
+    if np.sum(quality_mask) > MAX_KP_TO_TRACK:
+        # Sort by confidence and take top MAX_KP_TO_TRACK
+        sorted_indices = np.argsort(confidences)[-MAX_KP_TO_TRACK:]
+        quality_mask = np.zeros(len(keypoints), dtype=bool)
+        quality_mask[sorted_indices] = True
+
+    filtered_keypoints = keypoints[quality_mask]
+    filtered_reference_keypoints = reference_keypoints[quality_mask]
+
+    print(f"Quality filter: {len(filtered_keypoints)}/{len(keypoints)} keypoints kept")
+    return filtered_keypoints, filtered_reference_keypoints
+
+def validate_homography(H: np.ndarray,
+                       frame_keypoints: np.ndarray,
+                       reference_keypoints: np.ndarray) -> bool:
+    """
+    Validate homography matrix for stability and reasonableness.
+
+    Args:
+        H: Homography matrix [3, 3]
+        frame_keypoints: Frame keypoints [N, 2]
+        reference_keypoints: Reference keypoints [N, 2]
+
+    Returns:
+        True if homography is valid, False otherwise
+    """
+    if H is None:
+        return False
+
+    try:
+        # Check if homography is well-conditioned
+        det = np.linalg.det(H[:2, :2])
+        if abs(det) < 1e-6:
+            return False
+
+        # Check for reasonable transformation (not too extreme)
+        # Compute scale and rotation from homography
+        scale_x = np.linalg.norm(H[:2, 0])
+        scale_y = np.linalg.norm(H[:2, 1])
+
+        # Reject if scale is too extreme
+        if scale_x < 0.1 or scale_x > 10.0 or scale_y < 0.1 or scale_y > 10.0:
+            return False
+
+        # Check reprojection error
+        if len(frame_keypoints) >= 4 and len(reference_keypoints) >= 4:
+            # Project reference points using homography
+            ref_homogeneous = np.column_stack([reference_keypoints, np.ones(len(reference_keypoints))])
+            projected = H @ ref_homogeneous.T
+            projected = projected[:2] / projected[2]
+            projected = projected.T
+
+            # Calculate reprojection error
+            errors = np.linalg.norm(projected - frame_keypoints, axis=1)
+            mean_error = np.mean(errors)
+
+            # Reject if mean reprojection error is too high
+            if mean_error > 20.0:  # 20 pixels
+                return False
+
+        return True
+
+    except Exception:
+        return False
+
+def smooth_homography(current_H: np.ndarray) -> np.ndarray:
+    """
+    Apply temporal smoothing to homography matrix.
+
+    Args:
+        current_H: Current homography matrix [3, 3]
+
+    Returns:
+        Smoothed homography matrix [3, 3]
+    """
+    global previous_homography, homography_history
+
+    if not ENABLE_TEMPORAL_SMOOTHING:
+        return current_H
+
+    if current_H is None:
+        return None
+
+    # Add current homography to history
+    homography_history.append(current_H.copy())
+    if len(homography_history) > MAX_HISTORY_SIZE:
+        homography_history.pop(0)
+
+    # Simple temporal smoothing with previous homography
+    if previous_homography is not None:
+        # Check if the change is too dramatic
+        diff = np.linalg.norm(current_H - previous_homography)
+        normalized_diff = diff / np.linalg.norm(previous_homography)
+
+        if normalized_diff > MAX_HOMOGRAPHY_CHANGE:
+            print(f"Large homography change detected ({normalized_diff:.3f}), applying stronger smoothing")
+            # Apply stronger smoothing for large changes
+            smoothed_H = HOMOGRAPHY_SMOOTHING_ALPHA * previous_homography + (1 - HOMOGRAPHY_SMOOTHING_ALPHA) * current_H
+        else:
+            # Normal smoothing
+            smoothed_H = (1 - HOMOGRAPHY_SMOOTHING_ALPHA) * previous_homography + HOMOGRAPHY_SMOOTHING_ALPHA * current_H
+    else:
+        smoothed_H = current_H
+
+    # Update previous homography
+    previous_homography = smoothed_H.copy()
+
+    return smoothed_H
+
 def compute_homography_from_keypoints(frame_keypoints: np.ndarray,
                                      reference_keypoints: np.ndarray,
                                      method: int = cv2.RANSAC,
-                                     ransac_threshold: float = 8.0,
+                                     ransac_threshold: float = 5.0,  # Reduced from 8.0 for better stability
                                      confidence: float = 0.999,
-                                     max_iters: int = 10000) -> Optional[np.ndarray]:
+                                     max_iters: int = 2000) -> Optional[np.ndarray]:  # Reduced iterations for speed
     """
-    Compute homography matrix from corresponding keypoints using all available points.
+    Compute homography matrix from corresponding keypoints with validation and smoothing.
 
     Args:
         frame_keypoints: Keypoints in frame coordinates [N, 2]
@@ -483,15 +708,20 @@ def compute_homography_from_keypoints(frame_keypoints: np.ndarray,
             maxIters=max_iters
         )
 
-        # Check if homography is valid
-        if H is not None:
-            # Convert to float64 array to ensure proper type for determinant calculation
-            H_matrix = np.array(H, dtype=np.float64)
-            det = float(np.linalg.det(H_matrix[:2, :2]))
-            if abs(det) > 1e-6:  # Not nearly singular
-                return H
+        # Validate homography
+        if not validate_homography(H, frame_keypoints, reference_keypoints):
+            print("Homography validation failed")
+            return None
 
-        return None
+        # Apply temporal smoothing
+        H_smoothed = smooth_homography(H)
+
+        # Final validation after smoothing
+        if not validate_homography(H_smoothed, frame_keypoints, reference_keypoints):
+            print("Smoothed homography validation failed, using unsmoothed version")
+            return H
+
+        return H_smoothed
 
     except Exception as e:
         print(f"Homography computation failed: {e}")
@@ -1151,7 +1381,7 @@ def create_logo_replacement_pipeline():
 # Load models once (this should be done at startup)
 print("Loading MatchAnything models...")
 
-model_type = "roma"
+model_type = "eloftr"
 
 if model_type == "roma":
 	model, preprocessing_conf = load_matchanything_model("matchanything_roma", log_timing=True)
@@ -1245,23 +1475,53 @@ while video_stream.isOpened():
     # Check if we have detection results
     if results and len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes.xyxy
+        confidences = results[0].boxes.conf  # Get confidence scores
     else:
         boxes = None
+        confidences = None
 
     # Convert BGR to RGB for processing
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result_frame = frame_rgb.copy()
 
     if boxes is not None and boxes.shape[0] > 0:
-        # Extract bounding box - handle both tensor and numpy array cases
+        # Handle multiple detections by selecting the one with highest confidence
         if hasattr(boxes, 'cpu') and callable(getattr(boxes, 'cpu', None)):
             # It's a tensor
-            budlight_bbox = boxes.cpu().numpy().astype(int).squeeze()
+            boxes_np = boxes.cpu().numpy().astype(int)
+            confidences_np = confidences.cpu().numpy() if confidences is not None else None
         else:
             # It's already a numpy array
-            budlight_bbox = np.array(boxes).astype(int).squeeze()
+            boxes_np = np.array(boxes).astype(int)
+            confidences_np = np.array(confidences) if confidences is not None else None
 
-        print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
+        # Select the bounding box with highest confidence
+        if len(boxes_np.shape) == 2 and boxes_np.shape[0] > 1:
+            # Multiple detections - select the one with highest confidence
+            if confidences_np is not None:
+                best_idx = np.argmax(confidences_np)
+                budlight_bbox = boxes_np[best_idx]
+                best_confidence = confidences_np[best_idx]
+                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using highest confidence (conf={best_confidence:.3f}) at {budlight_bbox}")
+            else:
+                # No confidence scores available, use the first detection
+                budlight_bbox = boxes_np[0]
+                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using first detection at {budlight_bbox}")
+        else:
+            # Single detection or squeeze to 1D
+            budlight_bbox = boxes_np.squeeze()
+            if confidences_np is not None:
+                best_confidence = confidences_np.squeeze()
+                print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
+            else:
+                print(f"Frame {current_frame_number}: Detected Budlight logo at {budlight_bbox}")
+
+        # Ensure budlight_bbox is 1D array with 4 elements
+        if budlight_bbox.shape != (4,):
+            print(f"Frame {current_frame_number}: Invalid bounding box shape {budlight_bbox.shape}, expected (4,)")
+            print(f"Frame {current_frame_number}: ❌ Bounding box extraction failed")
+            current_frame_number += 1
+            continue
 
         # Get person masks for occlusion filtering
         person_mask = get_person_masks(
