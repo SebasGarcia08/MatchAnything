@@ -14,6 +14,8 @@ import os
 import torch
 from typing import TypedDict, Optional, List, Tuple, Union
 import logging
+from filterpy.kalman import ExtendedKalmanFilter
+from filterpy.common import Q_discrete_white_noise
 
 # Add the necessary paths
 sys.path.append(str(Path(__file__).parent))
@@ -32,11 +34,220 @@ from imcui.ui.utils import (
     DEFAULT_MIN_NUM_MATCHES, ransac_zoo, DEFAULT_RANSAC_METHOD
 )
 
+class HomographyEKF:
+    """
+    Extended Kalman Filter for homography matrix stabilization.
+    
+    This class implements an EKF to smooth homography matrices over time,
+    reducing jitter and improving temporal consistency in video logo replacement.
+    
+    The state vector represents the 8 independent parameters of the homography matrix
+    (excluding the last element which is normalized to 1) and their velocities.
+    
+    State vector: [h00, h01, h02, h10, h11, h12, h20, h21, 
+                   h00_vel, h01_vel, h02_vel, h10_vel, h11_vel, h12_vel, h20_vel, h21_vel]
+    """
+    
+    def __init__(self, 
+                 dt: float = 1.0,
+                 process_noise_std: float = 0.01,
+                 measurement_noise_std: float = 0.1,
+                 initial_covariance: float = 1.0):
+        """
+        Initialize the Homography EKF.
+        
+        Args:
+            dt: Time step between frames
+            process_noise_std: Standard deviation of process noise
+            measurement_noise_std: Standard deviation of measurement noise
+            initial_covariance: Initial state covariance
+        """
+        self.dt = dt
+        self.process_noise_std = process_noise_std
+        self.measurement_noise_std = measurement_noise_std
+        self.initial_covariance = initial_covariance
+        
+        # State dimension: 8 homography parameters + 8 velocities = 16
+        self.state_dim = 16
+        # Measurement dimension: 8 homography parameters
+        self.measurement_dim = 8
+        
+        # Initialize EKF
+        self.ekf = ExtendedKalmanFilter(dim_x=self.state_dim, dim_z=self.measurement_dim)
+        
+        # Initialize state vector (identity homography + zero velocities)
+        self.ekf.x = np.zeros(self.state_dim)
+        self.ekf.x[0] = 1.0  # h00 = 1
+        self.ekf.x[4] = 1.0  # h11 = 1
+        # h22 is implicitly 1 (not in state vector)
+        
+        # Initialize covariance matrix
+        self.ekf.P = np.eye(self.state_dim) * self.initial_covariance
+        
+        # State transition matrix (constant velocity model)
+        self.ekf.F = np.eye(self.state_dim)
+        # Position = position + velocity * dt
+        for i in range(8):
+            self.ekf.F[i, i + 8] = self.dt
+        
+        # Process noise covariance matrix
+        self.ekf.Q = np.eye(self.state_dim) * (self.process_noise_std ** 2)
+        
+        # Measurement noise covariance matrix
+        self.ekf.R = np.eye(self.measurement_dim) * (self.measurement_noise_std ** 2)
+        
+        self.initialized = False
+    
+    def measurement_function(self, x: np.ndarray) -> np.ndarray:
+        """
+        Measurement function that maps state to measurement.
+        For homography, we directly observe the first 8 parameters.
+        
+        Args:
+            x: State vector
+            
+        Returns:
+            Expected measurement vector
+        """
+        return x[:8]  # First 8 elements are the homography parameters
+    
+    def measurement_jacobian(self, x: np.ndarray) -> np.ndarray:
+        """
+        Jacobian of the measurement function.
+        
+        Args:
+            x: State vector
+            
+        Returns:
+            Jacobian matrix
+        """
+        H = np.zeros((self.measurement_dim, self.state_dim))
+        # Identity for the first 8 parameters, zero for velocities
+        for i in range(8):
+            H[i, i] = 1.0
+        return H
+    
+    def homography_to_vector(self, H: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Convert 3x3 homography matrix to 8-element vector.
+        
+        Args:
+            H: 3x3 homography matrix
+            
+        Returns:
+            8-element vector [h00, h01, h02, h10, h11, h12, h20, h21] or None if invalid
+        """
+        if H is None or H.size == 0:
+            return None
+        
+        # Normalize by h22 to ensure h22 = 1
+        H_normalized = H / H[2, 2]
+        
+        # Extract 8 parameters (excluding h22 which is 1)
+        h_vector = np.array([
+            H_normalized[0, 0], H_normalized[0, 1], H_normalized[0, 2],
+            H_normalized[1, 0], H_normalized[1, 1], H_normalized[1, 2],
+            H_normalized[2, 0], H_normalized[2, 1]
+        ])
+        
+        return h_vector
+    
+    def vector_to_homography(self, h_vector: np.ndarray) -> np.ndarray:
+        """
+        Convert 8-element vector to 3x3 homography matrix.
+        
+        Args:
+            h_vector: 8-element vector [h00, h01, h02, h10, h11, h12, h20, h21]
+            
+        Returns:
+            3x3 homography matrix
+        """
+        H = np.array([
+            [h_vector[0], h_vector[1], h_vector[2]],
+            [h_vector[3], h_vector[4], h_vector[5]],
+            [h_vector[6], h_vector[7], 1.0]
+        ])
+        
+        return H
+    
+    def predict(self) -> np.ndarray:
+        """
+        Predict the next state using the constant velocity model.
+        
+        Returns:
+            Predicted homography matrix
+        """
+        self.ekf.predict()
+        
+        # Extract homography parameters from state
+        h_vector = self.ekf.x[:8]
+        return self.vector_to_homography(h_vector)
+    
+    def update(self, H_measured: np.ndarray) -> np.ndarray:
+        """
+        Update the filter with a new homography measurement.
+        
+        Args:
+            H_measured: 3x3 measured homography matrix
+            
+        Returns:
+            Smoothed homography matrix
+        """
+        if H_measured is None or H_measured.size == 0:
+            # No measurement available, return prediction
+            return self.predict()
+        
+        # Convert homography to measurement vector
+        h_vector = self.homography_to_vector(H_measured)
+        
+        if h_vector is None:
+            return self.predict()
+        
+        if not self.initialized:
+            # Initialize state with first measurement
+            self.ekf.x[:8] = h_vector
+            self.ekf.x[8:] = 0.0  # Zero initial velocities
+            self.initialized = True
+            return H_measured
+        
+        # Predict step
+        self.ekf.predict()
+        
+        # Update step with measurement function and Jacobian
+        self.ekf.update(h_vector, self.measurement_jacobian, self.measurement_function)
+        
+        # Extract smoothed homography parameters
+        h_smoothed = self.ekf.x[:8]
+        H_smoothed = self.vector_to_homography(h_smoothed)
+        
+        return H_smoothed
+    
+    def get_state_info(self) -> dict:
+        """
+        Get current state information for debugging.
+        
+        Returns:
+            Dictionary containing state information
+        """
+        return {
+            'state': self.ekf.x.copy(),
+            'covariance_trace': np.trace(self.ekf.P),
+            'homography_params': self.ekf.x[:8].copy(),
+            'velocities': self.ekf.x[8:].copy(),
+            'initialized': self.initialized
+        }
+
 # Simple configuration for frame-by-frame processing
-ROMA_CONFIDENCE_THRESHOLD = 0.05
-MAX_KEYPOINTS = 2000
-MIN_KP_FOR_HOMOGRAPHY = 20
-RANSAC_THRESHOLD = 5.0
+MATCHING_CONFIDENCE_THRESHOLD = 0.3
+MAX_KEYPOINTS = 3000
+MIN_KP_FOR_HOMOGRAPHY = 4
+RANSAC_THRESHOLD = 15.0
+
+# EKF Configuration for homography stabilization
+EKF_ENABLED = True
+EKF_PROCESS_NOISE_STD = 0.005    # Lower = smoother but slower response
+EKF_MEASUREMENT_NOISE_STD = 0.1   # Lower = trust measurements more
+EKF_INITIAL_COVARIANCE = 0.1     # Initial uncertainty
 
 # Load overlay components
 # Configuration for transparency
@@ -493,6 +704,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
                         budlight_bbox: np.ndarray,
                         roma_model,
                         preprocessing_conf: dict,
+                        homography_ekf: Optional[HomographyEKF] = None,
                         expansion_factor: float = 0.1) -> np.ndarray:
     """
     Replace Budlight logo with SPATEN in a video frame.
@@ -502,6 +714,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         budlight_bbox: Bounding box of Budlight logo [x1, y1, x2, y2]
         roma_model: Loaded ROMA model for matching
         preprocessing_conf: Preprocessing configuration
+        homography_ekf: Optional EKF for homography stabilization
         expansion_factor: Factor to expand bounding box
 
     Returns:
@@ -520,7 +733,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         physical_logo_cropped,
         budlight_downsampled,  # Use the same Budlight logo used in overlay
         preprocessing_conf=preprocessing_conf,
-        match_threshold=ROMA_CONFIDENCE_THRESHOLD,
+        match_threshold=MATCHING_CONFIDENCE_THRESHOLD,
         extract_max_keypoints=MAX_KEYPOINTS,
         log_timing=False
     )
@@ -562,7 +775,19 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         print("Failed to compute SPATEN homography, returning original frame")
         return video_frame
 
-    # Step 5: Warp SPATEN logo to full frame size
+    # Step 5: Apply EKF stabilization to homography matrix
+    if homography_ekf is not None:
+        H_spaten_stabilized = homography_ekf.update(H_spaten)
+        
+        # Get EKF state information for debugging
+        ekf_info = homography_ekf.get_state_info()
+        print(f"EKF stabilization - covariance trace: {ekf_info['covariance_trace']:.6f}")
+        
+        H_spaten = H_spaten_stabilized
+    else:
+        print("EKF stabilization disabled, using raw homography")
+
+    # Step 6: Warp SPATEN logo to full frame size
     frame_h, frame_w = video_frame.shape[:2]
 
     if is_transparent:
@@ -580,7 +805,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
             (frame_w, frame_h)
         )
 
-    # Step 6: Create mask for entire frame and replace logo
+    # Step 7: Create mask for entire frame and replace logo
     if is_transparent:
         # For transparent logo, use alpha channel for masking
         spaten_alpha_warped = cv2.warpPerspective(
@@ -600,7 +825,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     frame_with_logo = video_frame.copy()
     frame_with_logo[mask_3d] = spaten_warped[mask_3d]
 
-    # Step 7: Get person masks and apply occlusion (bring people forward)
+    # Step 8: Get person masks and apply occlusion (bring people forward)
     person_mask = get_person_masks(
         video_frame,
         person_seg_model,
@@ -629,6 +854,17 @@ if model_type == "roma":
 else:
     model, preprocessing_conf = load_matchanything_model("matchanything_eloftr", log_timing=True)
 
+# Initialize EKF for homography stabilization
+homography_ekf = None
+if EKF_ENABLED:
+    homography_ekf = HomographyEKF(
+        dt=1.0,  # Assuming 1 frame time step
+        process_noise_std=EKF_PROCESS_NOISE_STD,
+        measurement_noise_std=EKF_MEASUREMENT_NOISE_STD,
+        initial_covariance=EKF_INITIAL_COVARIANCE
+    )
+    print("Homography EKF initialized for stabilization")
+
 print("Simple frame-by-frame processing ready!")
 
 # Video processing parameters
@@ -637,8 +873,8 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 # 01:26:05-01:26:17
 # 01:53:12-01:53:15
 # 00:50:42-00:50:48
-start_timestamp = "00:50:42"
-end_timestamp = "00:50:48"
+start_timestamp = "00:50:42" # "00:50:42"
+end_timestamp = "00:50:48" # "00:50:48"
 
 output_video_path = f"swapped_{model_type}_simple_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
@@ -757,6 +993,7 @@ while video_stream.isOpened():
             budlight_bbox,
             model,
             preprocessing_conf,
+            homography_ekf,
             expansion_factor=0.1
         )
 
