@@ -40,9 +40,9 @@ class DebugVisualizer:
 
     Handles all debugging visualizations including:
     - Bounding boxes on original frame
-    - Keypoints from MatchAnything
+    - Raw and filtered keypoints from MatchAnything
     - Person mask overlays
-    - Logo comparison with match lines
+    - Logo comparison with RANSAC-filtered match lines only
     """
 
     def __init__(self, enable_debug: bool = True):
@@ -121,15 +121,21 @@ class DebugVisualizer:
 
         return frame_copy
 
-    def _draw_keypoints(self, frame: np.ndarray, keypoints: np.ndarray,
-                       color: tuple = (255, 0, 0), radius: int = 3) -> np.ndarray:
+    def _draw_keypoints_dual(self, frame: np.ndarray,
+                            raw_keypoints: Optional[np.ndarray] = None,
+                            filtered_keypoints: Optional[np.ndarray] = None,
+                            raw_color: tuple = (100, 150, 255),  # Light blue for raw
+                            filtered_color: tuple = (255, 0, 0),  # Red for filtered
+                            radius: int = 3) -> np.ndarray:
         """
-        Draw keypoints on frame.
+        Draw both raw and filtered keypoints on frame with different colors.
 
         Args:
             frame: Input frame
-            keypoints: Keypoints as Nx2 array
-            color: BGR color tuple
+            raw_keypoints: Raw keypoints from MatchAnything
+            filtered_keypoints: RANSAC-filtered keypoints
+            raw_color: BGR color for raw keypoints
+            filtered_color: BGR color for filtered keypoints
             radius: Circle radius
 
         Returns:
@@ -137,9 +143,17 @@ class DebugVisualizer:
         """
         frame_copy = frame.copy()
 
-        for kp in keypoints:
-            x, y = kp.astype(int)
-            cv2.circle(frame_copy, (x, y), radius, color, -1)
+        # Draw raw keypoints first (underneath)
+        if raw_keypoints is not None and len(raw_keypoints) > 0:
+            for kp in raw_keypoints:
+                x, y = kp.astype(int)
+                cv2.circle(frame_copy, (x, y), radius, raw_color, -1)
+
+        # Draw filtered keypoints on top
+        if filtered_keypoints is not None and len(filtered_keypoints) > 0:
+            for kp in filtered_keypoints:
+                x, y = kp.astype(int)
+                cv2.circle(frame_copy, (x, y), radius, filtered_color, -1)
 
         return frame_copy
 
@@ -168,21 +182,22 @@ class DebugVisualizer:
 
         return result
 
-    def _draw_matches(self, img1: np.ndarray, img2: np.ndarray,
-                     kpts1: np.ndarray, kpts2: np.ndarray,
-                     matches: Optional[np.ndarray] = None) -> np.ndarray:
+    def _draw_matches_filtered_only(self, img1: np.ndarray, img2: np.ndarray,
+                                   raw_kpts1: np.ndarray, raw_kpts2: np.ndarray,
+                                   filtered_kpts1: np.ndarray, filtered_kpts2: np.ndarray) -> np.ndarray:
         """
-        Draw matches between two images.
+        Draw matches between two images showing raw and filtered keypoints with match lines only for filtered.
 
         Args:
             img1: First image (cropped logo)
             img2: Second image (reference logo)
-            kpts1: Keypoints in first image
-            kpts2: Keypoints in second image
-            matches: Optional match indices
+            raw_kpts1: Raw keypoints in first image
+            raw_kpts2: Raw keypoints in second image
+            filtered_kpts1: RANSAC-filtered keypoints in first image
+            filtered_kpts2: RANSAC-filtered keypoints in second image
 
         Returns:
-            Combined image with match lines
+            Combined image with keypoints and filtered match lines
         """
         h1, w1 = img1.shape[:2]
         h2, w2 = img2.shape[:2]
@@ -192,28 +207,29 @@ class DebugVisualizer:
         combined[:h1, :w1] = img1
         combined[:h2, w1:w1+w2] = img2
 
-        # Draw keypoints
-        for kp in kpts1:
+        # Draw raw keypoints first (light blue)
+        for kp in raw_kpts1:
             x, y = kp.astype(int)
-            cv2.circle(combined, (x, y), 3, (255, 0, 0), -1)
+            cv2.circle(combined, (x, y), 2, (100, 150, 255), -1)  # Light blue
 
-        for kp in kpts2:
+        for kp in raw_kpts2:
             x, y = kp.astype(int)
-            cv2.circle(combined, (x + w1, y), 3, (0, 255, 0), -1)
+            cv2.circle(combined, (x + w1, y), 2, (100, 150, 255), -1)  # Light blue
 
-        # Draw match lines
-        if matches is not None:
-            for i, match in enumerate(matches):
-                if i < len(kpts1) and match < len(kpts2):
-                    x1, y1 = kpts1[i].astype(int)
-                    x2, y2 = kpts2[match].astype(int)
-                    cv2.line(combined, (x1, y1), (x2 + w1, y2), (0, 255, 255), 1)
-        else:
-            # Draw all matches if no specific match indices provided
-            for i in range(min(len(kpts1), len(kpts2))):
-                x1, y1 = kpts1[i].astype(int)
-                x2, y2 = kpts2[i].astype(int)
-                cv2.line(combined, (x1, y1), (x2 + w1, y2), (0, 255, 255), 1)
+        # Draw filtered keypoints on top (red)
+        for kp in filtered_kpts1:
+            x, y = kp.astype(int)
+            cv2.circle(combined, (x, y), 3, (255, 0, 0), -1)  # Red
+
+        for kp in filtered_kpts2:
+            x, y = kp.astype(int)
+            cv2.circle(combined, (x + w1, y), 3, (255, 0, 0), -1)  # Red
+
+        # Draw match lines only for filtered keypoints (yellow)
+        for i in range(min(len(filtered_kpts1), len(filtered_kpts2))):
+            x1, y1 = filtered_kpts1[i].astype(int)
+            x2, y2 = filtered_kpts2[i].astype(int)
+            cv2.line(combined, (x1, y1), (x2 + w1, y2), (0, 255, 255), 1)
 
         return combined
 
@@ -291,11 +307,17 @@ class DebugVisualizer:
                     color=(0, 255, 0), label="Budlight Logo"
                 )
 
-            # Draw keypoints if available
-            if 'keypoints' in debug_info and debug_info['keypoints'] is not None:
-                debug_frame = self._draw_keypoints(
-                    debug_frame, debug_info['keypoints'],
-                    color=(255, 0, 0)
+            # Draw both raw and filtered keypoints if available
+            raw_keypoints = debug_info.get('raw_keypoints')
+            filtered_keypoints = debug_info.get('filtered_keypoints')
+
+            if raw_keypoints is not None or filtered_keypoints is not None:
+                debug_frame = self._draw_keypoints_dual(
+                    debug_frame,
+                    raw_keypoints=raw_keypoints,
+                    filtered_keypoints=filtered_keypoints,
+                    raw_color=(100, 150, 255),  # Light blue for raw
+                    filtered_color=(255, 0, 0)  # Red for filtered
                 )
 
             # Overlay person mask if available
@@ -309,10 +331,12 @@ class DebugVisualizer:
         show_matches = (debug_info and
                        'cropped_logo' in debug_info and
                        'reference_logo' in debug_info and
-                       'match_keypoints1' in debug_info and
-                       'match_keypoints2' in debug_info and
-                       len(debug_info['match_keypoints1']) > 0 and
-                       len(debug_info['match_keypoints2']) > 0)
+                       'raw_match_keypoints1' in debug_info and
+                       'raw_match_keypoints2' in debug_info and
+                       'filtered_match_keypoints1' in debug_info and
+                       'filtered_match_keypoints2' in debug_info and
+                       len(debug_info['filtered_match_keypoints1']) > 0 and
+                       len(debug_info['filtered_match_keypoints2']) > 0)
 
         if show_matches and not self.axes_restructured:
             self._restructure_for_matches()
@@ -332,18 +356,24 @@ class DebugVisualizer:
 
         # Update display based on layout
         if show_matches and debug_info is not None:
-            # Show match visualization
+            # Show enhanced match visualization
             cropped_logo = debug_info['cropped_logo']
             reference_logo = debug_info['reference_logo']
-            kpts1 = debug_info['match_keypoints1']
-            kpts2 = debug_info['match_keypoints2']
+            raw_kpts1 = debug_info['raw_match_keypoints1']
+            raw_kpts2 = debug_info['raw_match_keypoints2']
+            filtered_kpts1 = debug_info['filtered_match_keypoints1']
+            filtered_kpts2 = debug_info['filtered_match_keypoints2']
 
-            match_vis = self._draw_matches(cropped_logo, reference_logo, kpts1, kpts2)
+            match_vis = self._draw_matches_filtered_only(
+                cropped_logo, reference_logo,
+                raw_kpts1, raw_kpts2,
+                filtered_kpts1, filtered_kpts2
+            )
 
             if self.match_ax is not None:
                 self.match_ax.clear()
                 self.match_ax.imshow(match_vis)
-                self.match_ax.set_title(f'Logo Matches: {len(kpts1)} keypoints')
+                self.match_ax.set_title(f'Logo Matches: {len(raw_kpts1)} raw → {len(filtered_kpts1)} filtered (RANSAC lines only)')
                 self.match_ax.axis('off')
         else:
             # Show individual logos
@@ -363,8 +393,8 @@ class DebugVisualizer:
         if debug_info and 'stats' in debug_info:
             stats = debug_info['stats']
             stats_text = f"Frame: {frame_number}\n"
-            if 'num_matches' in stats:
-                stats_text += f"Matches: {stats['num_matches']}\n"
+            if 'num_raw_matches' in stats and 'num_filtered_matches' in stats:
+                stats_text += f"Matches: {stats['num_raw_matches']} raw → {stats['num_filtered_matches']} filtered\n"
             if 'ekf_info' in stats:
                 ekf_info = stats['ekf_info']
                 if ekf_info is not None:
@@ -1075,7 +1105,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     Returns:
         Tuple of (result_frame, debug_info_dict)
     """
-    debug_info = {} if collect_debug_info else None
+    debug_info: dict = {} if collect_debug_info else {}
 
     # Expand bounding box
     img_height, img_width = video_frame.shape[:2]
@@ -1084,7 +1114,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     # Crop the physical logo from video frame
     physical_logo_cropped = video_frame[y1:y2, x1:x2]
 
-    if collect_debug_info and debug_info is not None:
+    if collect_debug_info:
         debug_info['cropped_logo'] = physical_logo_cropped
         debug_info['reference_logo'] = budlight_downsampled
         debug_info['bbox'] = budlight_bbox
@@ -1109,7 +1139,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 
     if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
         print(f"Failed to find sufficient matches ({len(match_filtered.get('mmkpts0', []))} < {MIN_KP_FOR_HOMOGRAPHY}), returning original frame")
-        return video_frame, debug_info
+        return video_frame, debug_info if collect_debug_info else None
 
     # Step 3: Map Budlight keypoints to SPATEN keypoints
     budlight_keypoints = match_filtered['mmkpts1']  # Keypoints in digital Budlight
@@ -1123,10 +1153,20 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     physical_keypoints_full_frame[:, 0] += x1  # Add x offset
     physical_keypoints_full_frame[:, 1] += y1  # Add y offset
 
-    if collect_debug_info and debug_info is not None:
-        debug_info['keypoints'] = physical_keypoints_full_frame
-        debug_info['match_keypoints1'] = physical_keypoints
-        debug_info['match_keypoints2'] = budlight_keypoints
+    if collect_debug_info:
+        # Raw keypoints (all matches from MatchAnything)
+        raw_physical_keypoints = match_pred['mkpts0'].copy()
+        raw_physical_keypoints[:, 0] += x1  # Transform to full frame coordinates
+        raw_physical_keypoints[:, 1] += y1
+
+        debug_info['raw_keypoints'] = raw_physical_keypoints  # All raw keypoints in full frame
+        debug_info['filtered_keypoints'] = physical_keypoints_full_frame  # RANSAC filtered keypoints in full frame
+
+        # For match visualization (in cropped logo space)
+        debug_info['raw_match_keypoints1'] = match_pred['mkpts0']  # Raw keypoints in cropped logo
+        debug_info['raw_match_keypoints2'] = match_pred['mkpts1']  # Raw keypoints in reference logo
+        debug_info['filtered_match_keypoints1'] = physical_keypoints  # RANSAC filtered keypoints in cropped logo
+        debug_info['filtered_match_keypoints2'] = budlight_keypoints  # RANSAC filtered keypoints in reference logo
 
     # Compute homography: SPATEN -> full frame coordinates
     H_spaten, mask = cv2.findHomography(
@@ -1140,7 +1180,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 
     if H_spaten is None:
         print("Failed to compute SPATEN homography, returning original frame")
-        return video_frame, debug_info
+        return video_frame, debug_info if collect_debug_info else None
 
     # Step 5: Apply EKF stabilization to homography matrix
     if homography_ekf is not None:
@@ -1148,7 +1188,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 
         # Get EKF state information for debugging
         ekf_info = homography_ekf.get_state_info()
-        if collect_debug_info and debug_info is not None:
+        if collect_debug_info:
             debug_info['ekf_info'] = ekf_info
         print(f"EKF stabilization - covariance trace: {ekf_info['covariance_trace']:.6f}")
 
@@ -1202,7 +1242,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         log_timing=False
     )
 
-    if collect_debug_info and debug_info is not None:
+    if collect_debug_info:
         debug_info['person_mask'] = person_mask
 
     # Apply person occlusion to bring people in front of logo
@@ -1215,13 +1255,14 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 
     print(f"Logo replacement successful with {len(match_filtered['mmkpts0'])} keypoints")
 
-    if collect_debug_info and debug_info is not None:
+    if collect_debug_info:
         debug_info['stats'] = {
-            'num_matches': len(match_filtered['mmkpts0']),
+            'num_raw_matches': len(match_pred['mkpts0']),
+            'num_filtered_matches': len(match_filtered['mmkpts0']),
             'ekf_info': ekf_info if homography_ekf is not None else None
         }
 
-    return result_frame, debug_info
+    return result_frame, debug_info if collect_debug_info else None
 
 # Load models once (this should be done at startup)
 print("Loading MatchAnything models...")
@@ -1306,6 +1347,11 @@ while video_stream.isOpened():
         print(f"Reached end timestamp at frame {current_frame_number}")
         break
 
+    # Convert BGR to RGB for processing
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result_frame = frame_rgb.copy()
+    debug_info: Optional[dict] = None
+
     # Detect Budlight logo
     results: list[Results] = det_model_budlight.track(
         frame, conf=0.8,
@@ -1322,11 +1368,6 @@ while video_stream.isOpened():
     else:
         boxes = None
         confidences = None
-
-    # Convert BGR to RGB for processing
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result_frame = frame_rgb.copy()
-    debug_info = None
 
     if boxes is not None and boxes.shape[0] > 0:
         # Handle multiple detections by selecting the one with highest confidence
@@ -1388,7 +1429,7 @@ while video_stream.isOpened():
     fps = 1.0 / frame_time if frame_time > 0 else 0
 
     # Add processing time to debug info
-    if debug_info is not None and 'stats' in debug_info:
+    if debug_info is not None and isinstance(debug_info, dict) and 'stats' in debug_info and debug_info['stats'] is not None:
         debug_info['stats']['processing_time'] = frame_time
 
     # Update debug display
