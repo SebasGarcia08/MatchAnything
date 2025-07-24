@@ -34,28 +34,380 @@ from imcui.ui.utils import (
     DEFAULT_MIN_NUM_MATCHES, ransac_zoo, DEFAULT_RANSAC_METHOD
 )
 
+class DebugVisualizer:
+    """
+    Debug visualization class for logo replacement pipeline.
+
+    Handles all debugging visualizations including:
+    - Bounding boxes on original frame
+    - Keypoints from MatchAnything
+    - Person mask overlays
+    - Logo comparison with match lines
+    """
+
+    def __init__(self, enable_debug: bool = True):
+        """
+        Initialize the debug visualizer.
+
+        Args:
+            enable_debug: Whether to enable detailed debug visualizations
+        """
+        self.enable_debug = enable_debug
+        self.fig = None
+        self.axes = None
+        self.match_ax = None
+        self.axes_restructured = False
+
+        if self.enable_debug:
+            self._setup_debug_display()
+
+    def _setup_debug_display(self):
+        """Set up the matplotlib figure for debug display."""
+        plt.ion()  # Turn on interactive mode
+        self.fig, self.axes = plt.subplots(2, 2, figsize=(20, 15))
+
+        # Configure axes
+        self.axes[0, 0].set_title('Original Frame with Debug Info')
+        self.axes[0, 0].axis('off')
+
+        self.axes[0, 1].set_title('Logo Replacement Result')
+        self.axes[0, 1].axis('off')
+
+        self.axes[1, 0].set_title('Cropped Logo (Physical)')
+        self.axes[1, 0].axis('off')
+
+        self.axes[1, 1].set_title('Reference Logo (Digital)')
+        self.axes[1, 1].axis('off')
+
+        plt.tight_layout()
+
+    def _draw_bounding_box(self, frame: np.ndarray, bbox: np.ndarray,
+                          color: tuple = (0, 255, 0), thickness: int = 3,
+                          label: str = "") -> np.ndarray:
+        """
+        Draw bounding box on frame.
+
+        Args:
+            frame: Input frame
+            bbox: Bounding box as [x1, y1, x2, y2]
+            color: BGR color tuple
+            thickness: Line thickness
+            label: Optional label text
+
+        Returns:
+            Frame with bounding box drawn
+        """
+        frame_copy = frame.copy()
+        x1, y1, x2, y2 = bbox.astype(int)
+
+        # Draw rectangle
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), color, thickness)
+
+        # Draw label if provided
+        if label:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            font_thickness = 2
+
+            # Get text size for background
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
+
+            # Draw background rectangle
+            cv2.rectangle(frame_copy, (x1, y1 - text_height - 10),
+                         (x1 + text_width, y1), color, -1)
+
+            # Draw text
+            cv2.putText(frame_copy, label, (x1, y1 - 5), font, font_scale, (255, 255, 255), font_thickness)
+
+        return frame_copy
+
+    def _draw_keypoints(self, frame: np.ndarray, keypoints: np.ndarray,
+                       color: tuple = (255, 0, 0), radius: int = 3) -> np.ndarray:
+        """
+        Draw keypoints on frame.
+
+        Args:
+            frame: Input frame
+            keypoints: Keypoints as Nx2 array
+            color: BGR color tuple
+            radius: Circle radius
+
+        Returns:
+            Frame with keypoints drawn
+        """
+        frame_copy = frame.copy()
+
+        for kp in keypoints:
+            x, y = kp.astype(int)
+            cv2.circle(frame_copy, (x, y), radius, color, -1)
+
+        return frame_copy
+
+    def _overlay_mask(self, frame: np.ndarray, mask: np.ndarray,
+                     color: tuple = (0, 0, 255), alpha: float = 0.3) -> np.ndarray:
+        """
+        Overlay mask on frame with transparency.
+
+        Args:
+            frame: Input frame
+            mask: Binary mask
+            color: BGR color tuple
+            alpha: Transparency factor
+
+        Returns:
+            Frame with mask overlay
+        """
+        frame_copy = frame.copy()
+
+        # Create colored mask
+        colored_mask = np.zeros_like(frame_copy)
+        colored_mask[mask > 0] = color
+
+        # Blend with original frame
+        result = cv2.addWeighted(frame_copy, 1 - alpha, colored_mask, alpha, 0)
+
+        return result
+
+    def _draw_matches(self, img1: np.ndarray, img2: np.ndarray,
+                     kpts1: np.ndarray, kpts2: np.ndarray,
+                     matches: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Draw matches between two images.
+
+        Args:
+            img1: First image (cropped logo)
+            img2: Second image (reference logo)
+            kpts1: Keypoints in first image
+            kpts2: Keypoints in second image
+            matches: Optional match indices
+
+        Returns:
+            Combined image with match lines
+        """
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
+
+        # Create combined image
+        combined = np.zeros((max(h1, h2), w1 + w2, 3), dtype=np.uint8)
+        combined[:h1, :w1] = img1
+        combined[:h2, w1:w1+w2] = img2
+
+        # Draw keypoints
+        for kp in kpts1:
+            x, y = kp.astype(int)
+            cv2.circle(combined, (x, y), 3, (255, 0, 0), -1)
+
+        for kp in kpts2:
+            x, y = kp.astype(int)
+            cv2.circle(combined, (x + w1, y), 3, (0, 255, 0), -1)
+
+        # Draw match lines
+        if matches is not None:
+            for i, match in enumerate(matches):
+                if i < len(kpts1) and match < len(kpts2):
+                    x1, y1 = kpts1[i].astype(int)
+                    x2, y2 = kpts2[match].astype(int)
+                    cv2.line(combined, (x1, y1), (x2 + w1, y2), (0, 255, 255), 1)
+        else:
+            # Draw all matches if no specific match indices provided
+            for i in range(min(len(kpts1), len(kpts2))):
+                x1, y1 = kpts1[i].astype(int)
+                x2, y2 = kpts2[i].astype(int)
+                cv2.line(combined, (x1, y1), (x2 + w1, y2), (0, 255, 255), 1)
+
+        return combined
+
+    def _restructure_for_matches(self):
+        """Restructure the layout to show match visualization."""
+        if not self.axes_restructured and self.fig is not None and self.axes is not None:
+            try:
+                # Remove bottom axes
+                self.fig.delaxes(self.axes[1, 0])
+                self.fig.delaxes(self.axes[1, 1])
+
+                # Create new axis spanning both bottom plots
+                self.match_ax = self.fig.add_subplot(2, 1, 2)
+                self.match_ax.axis('off')
+
+                self.axes_restructured = True
+                plt.tight_layout()
+            except (KeyError, ValueError):
+                # Axes may already be removed, ignore error
+                pass
+
+    def _reset_layout(self):
+        """Reset to original 2x2 layout."""
+        if self.axes_restructured and self.fig is not None and self.axes is not None:
+            try:
+                if self.match_ax is not None:
+                    self.fig.delaxes(self.match_ax)
+                    self.match_ax = None
+
+                # Recreate bottom axes
+                self.axes = self.axes.tolist()  # Convert to list to modify
+                self.axes[1] = [
+                    self.fig.add_subplot(2, 2, 3),
+                    self.fig.add_subplot(2, 2, 4)
+                ]
+                self.axes = np.array(self.axes)  # Convert back to numpy array
+
+                self.axes[1, 0].axis('off')
+                self.axes[1, 1].axis('off')
+
+                self.axes_restructured = False
+                plt.tight_layout()
+            except (KeyError, ValueError, AttributeError):
+                # Handle any errors gracefully
+                pass
+
+    def update_display(self, frame_number: int, original_frame: np.ndarray,
+                      result_frame: np.ndarray, debug_info: Optional[dict] = None):
+        """
+        Update the display with current frame information.
+
+        Args:
+            frame_number: Current frame number
+            original_frame: Original input frame
+            result_frame: Processed result frame
+            debug_info: Optional debug information dictionary
+        """
+        if not self.enable_debug:
+            # Simple OpenCV display
+            cv2.imshow('Logo Replacement Result', cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
+            return
+
+        if self.axes is None or self.fig is None:
+            return
+
+        # Prepare debug frame
+        debug_frame = original_frame.copy()
+
+        if debug_info:
+            # Draw bounding box if available
+            if 'bbox' in debug_info and debug_info['bbox'] is not None:
+                debug_frame = self._draw_bounding_box(
+                    debug_frame, debug_info['bbox'],
+                    color=(0, 255, 0), label="Budlight Logo"
+                )
+
+            # Draw keypoints if available
+            if 'keypoints' in debug_info and debug_info['keypoints'] is not None:
+                debug_frame = self._draw_keypoints(
+                    debug_frame, debug_info['keypoints'],
+                    color=(255, 0, 0)
+                )
+
+            # Overlay person mask if available
+            if 'person_mask' in debug_info and debug_info['person_mask'] is not None:
+                debug_frame = self._overlay_mask(
+                    debug_frame, debug_info['person_mask'],
+                    color=(0, 0, 255), alpha=0.3
+                )
+
+        # Check if we need to show matches
+        show_matches = (debug_info and
+                       'cropped_logo' in debug_info and
+                       'reference_logo' in debug_info and
+                       'match_keypoints1' in debug_info and
+                       'match_keypoints2' in debug_info and
+                       len(debug_info['match_keypoints1']) > 0 and
+                       len(debug_info['match_keypoints2']) > 0)
+
+        if show_matches and not self.axes_restructured:
+            self._restructure_for_matches()
+        elif not show_matches and self.axes_restructured:
+            self._reset_layout()
+
+        # Clear and update top axes
+        self.axes[0, 0].clear()
+        self.axes[0, 0].imshow(debug_frame)
+        self.axes[0, 0].set_title(f'Original Frame {frame_number} with Debug Info')
+        self.axes[0, 0].axis('off')
+
+        self.axes[0, 1].clear()
+        self.axes[0, 1].imshow(result_frame)
+        self.axes[0, 1].set_title(f'Logo Replacement Result {frame_number}')
+        self.axes[0, 1].axis('off')
+
+        # Update display based on layout
+        if show_matches and debug_info is not None:
+            # Show match visualization
+            cropped_logo = debug_info['cropped_logo']
+            reference_logo = debug_info['reference_logo']
+            kpts1 = debug_info['match_keypoints1']
+            kpts2 = debug_info['match_keypoints2']
+
+            match_vis = self._draw_matches(cropped_logo, reference_logo, kpts1, kpts2)
+
+            if self.match_ax is not None:
+                self.match_ax.clear()
+                self.match_ax.imshow(match_vis)
+                self.match_ax.set_title(f'Logo Matches: {len(kpts1)} keypoints')
+                self.match_ax.axis('off')
+        else:
+            # Show individual logos
+            if debug_info and 'cropped_logo' in debug_info and 'reference_logo' in debug_info:
+                if not self.axes_restructured:
+                    self.axes[1, 0].clear()
+                    self.axes[1, 0].imshow(debug_info['cropped_logo'])
+                    self.axes[1, 0].set_title('Cropped Logo (Physical)')
+                    self.axes[1, 0].axis('off')
+
+                    self.axes[1, 1].clear()
+                    self.axes[1, 1].imshow(debug_info['reference_logo'])
+                    self.axes[1, 1].set_title('Reference Logo (Digital)')
+                    self.axes[1, 1].axis('off')
+
+        # Add frame statistics
+        if debug_info and 'stats' in debug_info:
+            stats = debug_info['stats']
+            stats_text = f"Frame: {frame_number}\n"
+            if 'num_matches' in stats:
+                stats_text += f"Matches: {stats['num_matches']}\n"
+            if 'ekf_info' in stats:
+                ekf_info = stats['ekf_info']
+                if ekf_info is not None:
+                    stats_text += f"EKF Covariance: {ekf_info.get('covariance_trace', 0):.6f}\n"
+            if 'processing_time' in stats:
+                stats_text += f"Processing: {stats['processing_time']:.3f}s\n"
+
+            self.fig.suptitle(stats_text, fontsize=10, ha='left', va='top')
+
+        plt.draw()
+        plt.pause(0.001)  # Small pause to allow matplotlib to update
+
+    def close(self):
+        """Close the debug display."""
+        if self.enable_debug:
+            plt.ioff()
+            if self.fig:
+                plt.close(self.fig)
+        else:
+            cv2.destroyAllWindows()
+
 class HomographyEKF:
     """
     Extended Kalman Filter for homography matrix stabilization.
-    
+
     This class implements an EKF to smooth homography matrices over time,
     reducing jitter and improving temporal consistency in video logo replacement.
-    
+
     The state vector represents the 8 independent parameters of the homography matrix
     (excluding the last element which is normalized to 1) and their velocities.
-    
-    State vector: [h00, h01, h02, h10, h11, h12, h20, h21, 
+
+    State vector: [h00, h01, h02, h10, h11, h12, h20, h21,
                    h00_vel, h01_vel, h02_vel, h10_vel, h11_vel, h12_vel, h20_vel, h21_vel]
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  dt: float = 1.0,
                  process_noise_std: float = 0.01,
                  measurement_noise_std: float = 0.1,
                  initial_covariance: float = 1.0):
         """
         Initialize the Homography EKF.
-        
+
         Args:
             dt: Time step between frames
             process_noise_std: Standard deviation of process noise
@@ -66,58 +418,58 @@ class HomographyEKF:
         self.process_noise_std = process_noise_std
         self.measurement_noise_std = measurement_noise_std
         self.initial_covariance = initial_covariance
-        
+
         # State dimension: 8 homography parameters + 8 velocities = 16
         self.state_dim = 16
         # Measurement dimension: 8 homography parameters
         self.measurement_dim = 8
-        
+
         # Initialize EKF
         self.ekf = ExtendedKalmanFilter(dim_x=self.state_dim, dim_z=self.measurement_dim)
-        
+
         # Initialize state vector (identity homography + zero velocities)
         self.ekf.x = np.zeros(self.state_dim)
         self.ekf.x[0] = 1.0  # h00 = 1
         self.ekf.x[4] = 1.0  # h11 = 1
         # h22 is implicitly 1 (not in state vector)
-        
+
         # Initialize covariance matrix
         self.ekf.P = np.eye(self.state_dim) * self.initial_covariance
-        
+
         # State transition matrix (constant velocity model)
         self.ekf.F = np.eye(self.state_dim)
         # Position = position + velocity * dt
         for i in range(8):
             self.ekf.F[i, i + 8] = self.dt
-        
+
         # Process noise covariance matrix
         self.ekf.Q = np.eye(self.state_dim) * (self.process_noise_std ** 2)
-        
+
         # Measurement noise covariance matrix
         self.ekf.R = np.eye(self.measurement_dim) * (self.measurement_noise_std ** 2)
-        
+
         self.initialized = False
-    
+
     def measurement_function(self, x: np.ndarray) -> np.ndarray:
         """
         Measurement function that maps state to measurement.
         For homography, we directly observe the first 8 parameters.
-        
+
         Args:
             x: State vector
-            
+
         Returns:
             Expected measurement vector
         """
         return x[:8]  # First 8 elements are the homography parameters
-    
+
     def measurement_jacobian(self, x: np.ndarray) -> np.ndarray:
         """
         Jacobian of the measurement function.
-        
+
         Args:
             x: State vector
-            
+
         Returns:
             Jacobian matrix
         """
@@ -126,39 +478,39 @@ class HomographyEKF:
         for i in range(8):
             H[i, i] = 1.0
         return H
-    
+
     def homography_to_vector(self, H: np.ndarray) -> Optional[np.ndarray]:
         """
         Convert 3x3 homography matrix to 8-element vector.
-        
+
         Args:
             H: 3x3 homography matrix
-            
+
         Returns:
             8-element vector [h00, h01, h02, h10, h11, h12, h20, h21] or None if invalid
         """
         if H is None or H.size == 0:
             return None
-        
+
         # Normalize by h22 to ensure h22 = 1
         H_normalized = H / H[2, 2]
-        
+
         # Extract 8 parameters (excluding h22 which is 1)
         h_vector = np.array([
             H_normalized[0, 0], H_normalized[0, 1], H_normalized[0, 2],
             H_normalized[1, 0], H_normalized[1, 1], H_normalized[1, 2],
             H_normalized[2, 0], H_normalized[2, 1]
         ])
-        
+
         return h_vector
-    
+
     def vector_to_homography(self, h_vector: np.ndarray) -> np.ndarray:
         """
         Convert 8-element vector to 3x3 homography matrix.
-        
+
         Args:
             h_vector: 8-element vector [h00, h01, h02, h10, h11, h12, h20, h21]
-            
+
         Returns:
             3x3 homography matrix
         """
@@ -167,65 +519,65 @@ class HomographyEKF:
             [h_vector[3], h_vector[4], h_vector[5]],
             [h_vector[6], h_vector[7], 1.0]
         ])
-        
+
         return H
-    
+
     def predict(self) -> np.ndarray:
         """
         Predict the next state using the constant velocity model.
-        
+
         Returns:
             Predicted homography matrix
         """
         self.ekf.predict()
-        
+
         # Extract homography parameters from state
         h_vector = self.ekf.x[:8]
         return self.vector_to_homography(h_vector)
-    
+
     def update(self, H_measured: np.ndarray) -> np.ndarray:
         """
         Update the filter with a new homography measurement.
-        
+
         Args:
             H_measured: 3x3 measured homography matrix
-            
+
         Returns:
             Smoothed homography matrix
         """
         if H_measured is None or H_measured.size == 0:
             # No measurement available, return prediction
             return self.predict()
-        
+
         # Convert homography to measurement vector
         h_vector = self.homography_to_vector(H_measured)
-        
+
         if h_vector is None:
             return self.predict()
-        
+
         if not self.initialized:
             # Initialize state with first measurement
             self.ekf.x[:8] = h_vector
             self.ekf.x[8:] = 0.0  # Zero initial velocities
             self.initialized = True
             return H_measured
-        
+
         # Predict step
         self.ekf.predict()
-        
+
         # Update step with measurement function and Jacobian
         self.ekf.update(h_vector, self.measurement_jacobian, self.measurement_function)
-        
+
         # Extract smoothed homography parameters
         h_smoothed = self.ekf.x[:8]
         H_smoothed = self.vector_to_homography(h_smoothed)
-        
+
         return H_smoothed
-    
+
     def get_state_info(self) -> dict:
         """
         Get current state information for debugging.
-        
+
         Returns:
             Dictionary containing state information
         """
@@ -242,6 +594,7 @@ MATCHING_CONFIDENCE_THRESHOLD = 0.3
 MAX_KEYPOINTS = 3000
 MIN_KP_FOR_HOMOGRAPHY = 4
 RANSAC_THRESHOLD = 15.0
+DEBUG = True
 
 # EKF Configuration for homography stabilization
 EKF_ENABLED = True
@@ -705,7 +1058,8 @@ def replace_logo_in_frame(video_frame: np.ndarray,
                         roma_model,
                         preprocessing_conf: dict,
                         homography_ekf: Optional[HomographyEKF] = None,
-                        expansion_factor: float = 0.1) -> np.ndarray:
+                        expansion_factor: float = 0.1,
+                        collect_debug_info: bool = False) -> tuple[np.ndarray, Optional[dict]]:
     """
     Replace Budlight logo with SPATEN in a video frame.
 
@@ -716,16 +1070,24 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         preprocessing_conf: Preprocessing configuration
         homography_ekf: Optional EKF for homography stabilization
         expansion_factor: Factor to expand bounding box
+        collect_debug_info: Whether to collect debug information
 
     Returns:
-        Video frame with SPATEN logo replacing Budlight and people brought forward
+        Tuple of (result_frame, debug_info_dict)
     """
+    debug_info = {} if collect_debug_info else None
+
     # Expand bounding box
     img_height, img_width = video_frame.shape[:2]
     x1, y1, x2, y2 = expand_box(budlight_bbox, expansion_factor, img_width, img_height)
 
     # Crop the physical logo from video frame
     physical_logo_cropped = video_frame[y1:y2, x1:x2]
+
+    if collect_debug_info and debug_info is not None:
+        debug_info['cropped_logo'] = physical_logo_cropped
+        debug_info['reference_logo'] = budlight_downsampled
+        debug_info['bbox'] = budlight_bbox
 
     # Step 1: Match physical logo with digital Budlight
     match_pred = run_matching_simple(
@@ -747,7 +1109,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 
     if len(match_filtered['H']) == 0 or len(match_filtered['mmkpts0']) < MIN_KP_FOR_HOMOGRAPHY:
         print(f"Failed to find sufficient matches ({len(match_filtered.get('mmkpts0', []))} < {MIN_KP_FOR_HOMOGRAPHY}), returning original frame")
-        return video_frame
+        return video_frame, debug_info
 
     # Step 3: Map Budlight keypoints to SPATEN keypoints
     budlight_keypoints = match_filtered['mmkpts1']  # Keypoints in digital Budlight
@@ -761,6 +1123,11 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     physical_keypoints_full_frame[:, 0] += x1  # Add x offset
     physical_keypoints_full_frame[:, 1] += y1  # Add y offset
 
+    if collect_debug_info and debug_info is not None:
+        debug_info['keypoints'] = physical_keypoints_full_frame
+        debug_info['match_keypoints1'] = physical_keypoints
+        debug_info['match_keypoints2'] = budlight_keypoints
+
     # Compute homography: SPATEN -> full frame coordinates
     H_spaten, mask = cv2.findHomography(
         spaten_keypoints,  # Source: SPATEN coordinates
@@ -773,16 +1140,18 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 
     if H_spaten is None:
         print("Failed to compute SPATEN homography, returning original frame")
-        return video_frame
+        return video_frame, debug_info
 
     # Step 5: Apply EKF stabilization to homography matrix
     if homography_ekf is not None:
         H_spaten_stabilized = homography_ekf.update(H_spaten)
-        
+
         # Get EKF state information for debugging
         ekf_info = homography_ekf.get_state_info()
+        if collect_debug_info and debug_info is not None:
+            debug_info['ekf_info'] = ekf_info
         print(f"EKF stabilization - covariance trace: {ekf_info['covariance_trace']:.6f}")
-        
+
         H_spaten = H_spaten_stabilized
     else:
         print("EKF stabilization disabled, using raw homography")
@@ -833,6 +1202,9 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         log_timing=False
     )
 
+    if collect_debug_info and debug_info is not None:
+        debug_info['person_mask'] = person_mask
+
     # Apply person occlusion to bring people in front of logo
     result_frame = apply_person_occlusion(
         frame_with_logo,
@@ -842,7 +1214,14 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     )
 
     print(f"Logo replacement successful with {len(match_filtered['mmkpts0'])} keypoints")
-    return result_frame
+
+    if collect_debug_info and debug_info is not None:
+        debug_info['stats'] = {
+            'num_matches': len(match_filtered['mmkpts0']),
+            'ekf_info': ekf_info if homography_ekf is not None else None
+        }
+
+    return result_frame, debug_info
 
 # Load models once (this should be done at startup)
 print("Loading MatchAnything models...")
@@ -903,17 +1282,13 @@ out = cv2.VideoWriter(
     (frame_width, frame_height)
 )
 
-# Set up matplotlib for displaying frames
-plt.ion()  # Turn on interactive mode
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
-ax1.set_title('Original Frame')
-ax1.axis('off')
-ax2.set_title('Simple Logo Replacement Result')
-ax2.axis('off')
+# Initialize debug visualizer
+debug_visualizer = DebugVisualizer(enable_debug=DEBUG)
 
 print(f"Starting simple frame-by-frame processing from frame {start_frame} to {end_frame}")
 print(f"Video FPS: {video_fps}")
 print(f"Using MatchAnything {model_type} on every frame")
+print(f"Debug mode: {'ON' if DEBUG else 'OFF'}")
 
 # Performance tracking
 total_times = []
@@ -951,6 +1326,7 @@ while video_stream.isOpened():
     # Convert BGR to RGB for processing
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result_frame = frame_rgb.copy()
+    debug_info = None
 
     if boxes is not None and boxes.shape[0] > 0:
         # Handle multiple detections by selecting the one with highest confidence
@@ -988,13 +1364,14 @@ while video_stream.isOpened():
             continue
 
         # Replace logo using simple frame-by-frame approach
-        result_frame = replace_logo_in_frame(
+        result_frame, debug_info = replace_logo_in_frame(
             frame_rgb,
             budlight_bbox,
             model,
             preprocessing_conf,
             homography_ekf,
-            expansion_factor=0.1
+            expansion_factor=0.1,
+            collect_debug_info=DEBUG
         )
 
         print(f"Frame {current_frame_number}: ✅ Logo processing completed")
@@ -1005,34 +1382,31 @@ while video_stream.isOpened():
     result_frame_bgr = cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR)
     out.write(result_frame_bgr)
 
-    # Display both frames side by side
-    ax1.clear()
-    ax1.imshow(frame_rgb)
-    ax1.set_title(f'Original Frame {current_frame_number}')
-    ax1.axis('off')
-
-    ax2.clear()
-    ax2.imshow(result_frame)
-    ax2.set_title(f'Simple Logo Replacement Result {current_frame_number}')
-    ax2.axis('off')
-
-    plt.draw()
-    plt.pause(0.001)  # Small pause to allow matplotlib to update
-
     # Performance metrics
     frame_time = time.time() - start_time_frame
     total_times.append(frame_time)
     fps = 1.0 / frame_time if frame_time > 0 else 0
+
+    # Add processing time to debug info
+    if debug_info is not None and 'stats' in debug_info:
+        debug_info['stats']['processing_time'] = frame_time
+
+    # Update debug display
+    debug_visualizer.update_display(
+        current_frame_number,
+        frame_rgb,
+        result_frame,
+        debug_info
+    )
+
     print(f"Frame {current_frame_number}: Processing time: {frame_time:.3f}s, FPS: {fps:.1f}")
 
     current_frame_number += 1
 
 video_stream.release()
 out.release()
-plt.ioff()  # Turn off interactive mode
-plt.show()
+debug_visualizer.close()
 
-# Print performance statistics
 print("\n" + "="*50)
 print("SIMPLE FRAME-BY-FRAME PERFORMANCE STATISTICS")
 print("="*50)
