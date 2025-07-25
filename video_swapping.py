@@ -405,7 +405,7 @@ class DebugVisualizer:
             self.fig.suptitle(stats_text, fontsize=10, ha='left', va='top')
 
         plt.draw()
-        plt.pause(0.001)  # Small pause to allow matplotlib to update
+        plt.pause(0.0005)  # Small pause to allow matplotlib to update
 
     def close(self):
         """Close the debug display."""
@@ -620,20 +620,20 @@ class HomographyEKF:
         }
 
 # Simple configuration for frame-by-frame processing
-MATCHING_CONFIDENCE_THRESHOLD = 0.2
+MATCHING_CONFIDENCE_THRESHOLD = 0.1
 MAX_KEYPOINTS = 6000
 MIN_KP_FOR_HOMOGRAPHY = 200
 MIN_BBOX_W = 200
 MIN_BBOX_H = 50
-RANSAC_THRESHOLD = 20
+RANSAC_THRESHOLD = 30
 DEBUG = True
 
 # Optical Flow Tracking Configuration
-KEYFRAME_INTERVAL = 15  # Run MatchAnything every N frames
+KEYFRAME_INTERVAL = 60  # Run MatchAnything every N frames
 MIN_TRACKING_POINTS = 150  # Minimum points to continue tracking
 MAX_FB_ERROR = 1.0  # Forward-backward error threshold (pixels) - stricter for better quality
 LK_WIN_SIZE = (15, 15)  # LK window size
-LK_MAX_LEVEL = 5  # Pyramid levels
+LK_MAX_LEVEL = 3  # Pyramid levels
 LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 
 # EKF Configuration for homography stabilization
