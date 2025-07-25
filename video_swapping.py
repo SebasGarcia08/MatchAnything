@@ -629,11 +629,11 @@ RANSAC_THRESHOLD = 15.0
 DEBUG = True
 
 # Optical Flow Tracking Configuration
-KEYFRAME_INTERVAL = 3  # Run MatchAnything every N frames
+KEYFRAME_INTERVAL = 15  # Run MatchAnything every N frames
 MIN_TRACKING_POINTS = 150  # Minimum points to continue tracking
-MAX_FB_ERROR = 1.5  # Forward-backward error threshold (pixels)
+MAX_FB_ERROR = 1.0  # Forward-backward error threshold (pixels) - stricter for better quality
 LK_WIN_SIZE = (15, 15)  # LK window size
-LK_MAX_LEVEL = 4  # Pyramid levels
+LK_MAX_LEVEL = 5  # Pyramid levels
 LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 
 # EKF Configuration for homography stabilization
@@ -1393,7 +1393,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
 # Load models once (this should be done at startup)
 print("Loading MatchAnything models...")
 
-model_type = "eloftr"
+model_type = "roma"
 
 if model_type == "roma":
     model, preprocessing_conf = load_matchanything_model("matchanything_roma", log_timing=True)
@@ -1421,9 +1421,10 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 # 01:53:12-01:53:15 (shorter test)
 # 00:50:42-00:50:48 (stable scene)
 # 01:55:12-01:55:35 (longer test)
-# 00:50:42_00:50:48
-start_timestamp = "00:50:42"
-end_timestamp = "00:50:48"
+# 00:50:42_00:50:48 (good conditions)
+# 35:39-00:35:43
+start_timestamp = "00:35:39"
+end_timestamp = "00:36:05"
 
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
