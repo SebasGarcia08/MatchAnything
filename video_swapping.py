@@ -622,7 +622,9 @@ class HomographyEKF:
 # Simple configuration for frame-by-frame processing
 MATCHING_CONFIDENCE_THRESHOLD = 0.3
 MAX_KEYPOINTS = 3000
-MIN_KP_FOR_HOMOGRAPHY = 4
+MIN_KP_FOR_HOMOGRAPHY = 200
+MIN_BBOX_W = 400
+MIN_BBOX_H = 200
 RANSAC_THRESHOLD = 15.0
 DEBUG = True
 
@@ -824,7 +826,7 @@ def run_matching_simple(
 
 def filter_matches_ransac(
     prediction: MatchPrediction,
-    ransac_method: str = "CV2_USAC_MAGSAC",
+    ransac_method: str = "CV2_USAC_MAGSAC_PLUS",
     ransac_reproj_threshold: float = 8.0,
     ransac_confidence: float = 0.999,
     ransac_max_iter: int = 10000,
@@ -1172,7 +1174,7 @@ def replace_logo_in_frame(video_frame: np.ndarray,
     H_spaten, mask = cv2.findHomography(
         spaten_keypoints,  # Source: SPATEN coordinates
         physical_keypoints_full_frame,  # Target: full frame coordinates
-        cv2.RANSAC,
+        cv2.USAC_MAGSAC,
         ransacReprojThreshold=RANSAC_THRESHOLD,
         confidence=0.999,
         maxIters=10000
@@ -1296,6 +1298,12 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 start_timestamp = "00:50:42" # "00:50:42"
 end_timestamp = "00:50:48" # "00:50:48"
 
+# 01:53:12-01:53:15
+# 02:07:04-02:07:14
+# 01:55:12-01:55:35
+start_timestamp = "01:55:12" # "00:50:42"
+end_timestamp = "01:55:35" # "00:50:48"
+
 output_video_path = f"swapped_{model_type}_simple_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
 tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
@@ -1403,6 +1411,19 @@ while video_stream.isOpened():
             print(f"Frame {current_frame_number}: ❌ Bounding box extraction failed")
             current_frame_number += 1
             continue
+        #bbox_w = budlight_bbox[2] - budlight_bbox[0]  # x2 - x1
+        #bbox_h = budlight_bbox[3] - budlight_bbox[1]  # y2 - y1
+
+        #if bbox_w < MIN_BBOX_W:
+        #    print(f"Frame {current_frame_number}: ❌ Bounding box width too small")
+        #    current_frame_number += 1
+        #    continue
+
+        #if bbox_h < MIN_BBOX_H:
+        #    print(f"Frame {current_frame_number}: ❌ Bounding box height too small")
+        #    current_frame_number += 1
+        #    continue
+
 
         # Replace logo using simple frame-by-frame approach
         result_frame, debug_info = replace_logo_in_frame(
