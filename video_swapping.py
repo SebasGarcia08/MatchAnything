@@ -1490,6 +1490,9 @@ end_timestamp = "00:50:48"
 start_timestamp = "01:55:12"
 end_timestamp = "01:55:51"
 
+start_timestamp = "00:35:39"
+end_timestamp = "00:36:05"
+
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
 tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
@@ -1626,10 +1629,13 @@ while video_stream.isOpened():
             if bbox_w < MIN_BBOX_W:
                 print(f"Frame {current_frame_number}: ❌ Bounding box width too small ({bbox_w} < {MIN_BBOX_W})")
                 budlight_bbox = None
+                tracking_state["is_tracking"] = False
 
             if bbox_h < MIN_BBOX_H:
                 print(f"Frame {current_frame_number}: ❌ Bounding box height too small ({bbox_h} < {MIN_BBOX_H})")
                 budlight_bbox = None
+                # TODO: improve later
+                tracking_state["is_tracking"] = False
     else:
         budlight_bbox = None
 
