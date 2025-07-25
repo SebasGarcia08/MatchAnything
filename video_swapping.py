@@ -34,6 +34,172 @@ from imcui.ui.utils import (
     DEFAULT_MIN_NUM_MATCHES, ransac_zoo, DEFAULT_RANSAC_METHOD
 )
 
+
+# Raw match prediction
+class MatchPrediction(TypedDict):
+    # Matched points before filtering with RANSAC
+    # the points x,y coordinate must match with the shape of the
+    # input images ("mkeypoints0_orig", "mkeypoints1_orig")
+    mkpts0: np.ndarray # matched points in image0 as Nx2 numpy array.
+    mkpts1: np.ndarray # matched points in image1 as Nx2 numpy array.
+    # Additional required keys for RANSAC filtering
+    mkeypoints0_orig: np.ndarray  # matched points in original image0 coordinates
+    mkeypoints1_orig: np.ndarray  # matched points in original image1 coordinates
+    mconf: np.ndarray  # confidence scores for matches
+    image0_orig: np.ndarray  # original image0
+    image1_orig: np.ndarray  # original image1
+
+class FilteredMatchPrediction(MatchPrediction):
+    # Homography matrix estimated after RANSAC filtering
+    H: np.ndarray
+    # Matched points after filtering with RANSAC
+    # the points x,y coordinate must match with the shape of the
+    # input images ("mkeypoints0_orig", "mkeypoints1_orig")
+    mmkpts0: np.ndarray # matched points in image0 as Nx2 numpy array.
+    mmkpts1: np.ndarray # matched points in image1 as Nx2 numpy array.
+    mmkeypoints0_orig: np.ndarray  # RANSAC filtered matches in original image0 coordinates
+    mmkeypoints1_orig: np.ndarray  # RANSAC filtered matches in original image1 coordinates
+    mmconf: np.ndarray  # confidence scores for RANSAC filtered matches
+
+
+def check_bbox_person_overlap(bbox: np.ndarray, person_mask: np.ndarray,
+                             overlap_threshold: float = 0.1) -> tuple[bool, float]:
+    """
+    Check if bounding box overlaps significantly with person masks.
+
+    Args:
+        bbox: Bounding box as [x1, y1, x2, y2]
+        person_mask: Binary person mask (same size as frame)
+        overlap_threshold: Minimum overlap ratio to consider significant
+
+    Returns:
+        Tuple of (has_overlap, overlap_ratio)
+    """
+    if person_mask is None or bbox is None:
+        return False, 0.0
+
+    x1, y1, x2, y2 = bbox.astype(int)
+
+    # Clamp bbox to image bounds
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(person_mask.shape[1], x2)
+    y2 = min(person_mask.shape[0], y2)
+
+    # Extract bbox region from person mask
+    bbox_region = person_mask[y1:y2, x1:x2]
+
+    if bbox_region.size == 0:
+        return False, 0.0
+
+    # Calculate overlap ratio
+    person_pixels = np.sum(bbox_region > 0)
+    total_pixels = bbox_region.size
+    overlap_ratio = person_pixels / total_pixels if total_pixels > 0 else 0.0
+
+    has_overlap = overlap_ratio >= overlap_threshold
+
+    return bool(has_overlap), float(overlap_ratio)
+
+def filter_matches_by_person_mask(match_prediction: MatchPrediction,
+                                 person_mask_cropped: np.ndarray,
+                                 log_timing: bool = False) -> MatchPrediction:
+    """
+    Filter MatchAnything results by person mask before RANSAC to improve efficiency.
+
+    Args:
+        match_prediction: Raw match prediction from MatchAnything
+        person_mask_cropped: Person mask for the cropped logo region
+        log_timing: Whether to log processing time
+
+    Returns:
+        Filtered MatchPrediction with person-overlapping matches removed
+    """
+    if log_timing:
+        t0 = time.time()
+
+    if person_mask_cropped is None or len(match_prediction['mkpts0']) == 0:
+        return match_prediction
+
+    # Filter keypoints in cropped logo (mkpts0) that overlap with people
+    mkpts0 = match_prediction['mkpts0']
+    mkpts1 = match_prediction['mkpts1']
+    mconf = match_prediction['mconf']
+
+    valid_mask = np.ones(len(mkpts0), dtype=bool)
+
+    for i, (x, y) in enumerate(mkpts0):
+        # Convert to integer coordinates and clamp to mask bounds
+        x_int = int(np.clip(x, 0, person_mask_cropped.shape[1] - 1))
+        y_int = int(np.clip(y, 0, person_mask_cropped.shape[0] - 1))
+
+        # Check if this keypoint overlaps with a person
+        if person_mask_cropped[y_int, x_int] > 0:
+            valid_mask[i] = False
+
+    # Filter all match arrays
+    filtered_mkpts0 = mkpts0[valid_mask]
+    filtered_mkpts1 = mkpts1[valid_mask]
+    filtered_mconf = mconf[valid_mask]
+
+    if log_timing:
+        removed_count = len(mkpts0) - len(filtered_mkpts0)
+        print(f"Person mask pre-filtering completed in {time.time() - t0:.3f}s")
+        print(f"  Removed {removed_count}/{len(mkpts0)} matches overlapping with people before RANSAC")
+
+    # Return filtered prediction
+    return MatchPrediction(
+        mkpts0=filtered_mkpts0,
+        mkpts1=filtered_mkpts1,
+        mkeypoints0_orig=filtered_mkpts0,
+        mkeypoints1_orig=filtered_mkpts1,
+        mconf=filtered_mconf,
+        image0_orig=match_prediction['image0_orig'],
+        image1_orig=match_prediction['image1_orig']
+    )
+
+def filter_keypoints_by_person_mask_lk(keypoints: np.ndarray,
+                                      person_mask: np.ndarray,
+                                      log_timing: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Filter out keypoints that overlap with person masks for LK tracking.
+
+    Args:
+        keypoints: Array of keypoints as Nx2 (x, y) coordinates
+        person_mask: Binary person mask (same size as frame)
+        log_timing: Whether to log processing time
+
+    Returns:
+        Tuple of (filtered_keypoints, valid_mask) where valid_mask indicates which keypoints survived
+    """
+    if log_timing:
+        t0 = time.time()
+
+    if len(keypoints) == 0 or person_mask is None:
+        return keypoints, np.ones(len(keypoints), dtype=bool)
+
+    # Check which keypoints fall inside person regions
+    valid_mask = np.ones(len(keypoints), dtype=bool)
+
+    for i, (x, y) in enumerate(keypoints):
+        # Convert to integer coordinates and clamp to image bounds
+        x_int = int(np.clip(x, 0, person_mask.shape[1] - 1))
+        y_int = int(np.clip(y, 0, person_mask.shape[0] - 1))
+
+        # Check if this point is inside a person region
+        if person_mask[y_int, x_int] > 0:
+            valid_mask[i] = False
+
+    # Filter keypoints
+    filtered_keypoints = keypoints[valid_mask]
+
+    if log_timing:
+        removed_count = len(keypoints) - len(filtered_keypoints)
+        print(f"Person mask filtering completed in {time.time() - t0:.3f}s")
+        print(f"  Removed {removed_count}/{len(keypoints)} keypoints that overlap with people")
+
+    return filtered_keypoints, valid_mask
+
 class DebugVisualizer:
     """
     Debug visualization class for logo replacement pipeline.
@@ -632,7 +798,7 @@ DEBUG_VERBOSE = DEBUG and False
 CONF_THR_LOGO_DETECTOR = 0.6
 
 # Optical Flow Tracking Configuration
-KEYFRAME_INTERVAL = 60  # Run MatchAnything every N frames
+KEYFRAME_INTERVAL = 30  # Run MatchAnything every N frames
 # TODO: implement min sparse is required for tracked points
 MIN_TRACKING_POINTS = 400  # Minimum points to continue tracking
 MAX_FB_ERROR = 1.0  # Forward-backward error threshold (pixels) - stricter for better quality
@@ -692,31 +858,6 @@ print(f"YOLO segmentation model loaded successfully!")
 # Person class IDs in COCO dataset (0 = person)
 PERSON_CLASS_IDS = [0]
 
-# Raw match prediction
-class MatchPrediction(TypedDict):
-    # Matched points before filtering with RANSAC
-    # the points x,y coordinate must match with the shape of the
-    # input images ("mkeypoints0_orig", "mkeypoints1_orig")
-    mkpts0: np.ndarray # matched points in image0 as Nx2 numpy array.
-    mkpts1: np.ndarray # matched points in image1 as Nx2 numpy array.
-    # Additional required keys for RANSAC filtering
-    mkeypoints0_orig: np.ndarray  # matched points in original image0 coordinates
-    mkeypoints1_orig: np.ndarray  # matched points in original image1 coordinates
-    mconf: np.ndarray  # confidence scores for matches
-    image0_orig: np.ndarray  # original image0
-    image1_orig: np.ndarray  # original image1
-
-class FilteredMatchPrediction(MatchPrediction):
-    # Homography matrix estimated after RANSAC filtering
-    H: np.ndarray
-    # Matched points after filtering with RANSAC
-    # the points x,y coordinate must match with the shape of the
-    # input images ("mkeypoints0_orig", "mkeypoints1_orig")
-    mmkpts0: np.ndarray # matched points in image0 as Nx2 numpy array.
-    mmkpts1: np.ndarray # matched points in image1 as Nx2 numpy array.
-    mmkeypoints0_orig: np.ndarray  # RANSAC filtered matches in original image0 coordinates
-    mmkeypoints1_orig: np.ndarray  # RANSAC filtered matches in original image1 coordinates
-    mmconf: np.ndarray  # confidence scores for RANSAC filtered matches
 
 def load_matchanything_model(
     model_name: str = "matchanything_eloftr",
@@ -1315,6 +1456,35 @@ def replace_logo_in_frame(video_frame: np.ndarray,
         extract_max_keypoints=MAX_KEYPOINTS,
         log_timing=False
     )
+
+    # Step 1.5: Filter matches by person mask before RANSAC for efficiency
+    if collect_debug_info or True:  # Always do this optimization
+        # Get person mask for the current frame
+        frame_person_mask = get_person_masks(
+            video_frame,
+            person_seg_model,
+            confidence_threshold=0.5,
+            log_timing=False
+        )
+
+        # Check if there's overlap between logo bbox and people
+        expanded_bbox = np.array([x1, y1, x2, y2])
+        has_overlap, overlap_ratio = check_bbox_person_overlap(expanded_bbox, frame_person_mask)
+
+        if has_overlap:
+            print(f"Person-logo overlap detected ({overlap_ratio:.1%}), pre-filtering matches before RANSAC")
+
+            # Extract person mask for the cropped logo region
+            person_mask_cropped = frame_person_mask[y1:y2, x1:x2]
+
+            # Filter matches that overlap with people before RANSAC
+            match_pred = filter_matches_by_person_mask(
+                match_pred,
+                person_mask_cropped,
+                log_timing=False
+            )
+
+            print(f"Pre-filtering reduced matches from raw to {len(match_pred['mkpts0'])} for more efficient RANSAC")
 
     # Step 2: Filter matches with RANSAC
     match_filtered = filter_matches_ransac(
