@@ -620,12 +620,12 @@ class HomographyEKF:
         }
 
 # Simple configuration for frame-by-frame processing
-MATCHING_CONFIDENCE_THRESHOLD = 0.3
-MAX_KEYPOINTS = 3000
+MATCHING_CONFIDENCE_THRESHOLD = 0.2
+MAX_KEYPOINTS = 6000
 MIN_KP_FOR_HOMOGRAPHY = 200
 MIN_BBOX_W = 200
 MIN_BBOX_H = 50
-RANSAC_THRESHOLD = 15.0
+RANSAC_THRESHOLD = 20
 DEBUG = True
 
 # Optical Flow Tracking Configuration
@@ -638,7 +638,7 @@ LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 
 # EKF Configuration for homography stabilization
 EKF_ENABLED = True
-EKF_PROCESS_NOISE_STD = 0.005    # Lower = smoother but slower response
+EKF_PROCESS_NOISE_STD = 0.01    # Lower = smoother but slower response
 EKF_MEASUREMENT_NOISE_STD = 0.1   # Lower = trust measurements more
 EKF_INITIAL_COVARIANCE = 0.1     # Initial uncertainty
 
