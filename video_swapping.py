@@ -623,10 +623,18 @@ class HomographyEKF:
 MATCHING_CONFIDENCE_THRESHOLD = 0.3
 MAX_KEYPOINTS = 3000
 MIN_KP_FOR_HOMOGRAPHY = 200
-MIN_BBOX_W = 400
-MIN_BBOX_H = 200
+MIN_BBOX_W = 200
+MIN_BBOX_H = 50
 RANSAC_THRESHOLD = 15.0
 DEBUG = True
+
+# Optical Flow Tracking Configuration
+KEYFRAME_INTERVAL = 3  # Run MatchAnything every N frames
+MIN_TRACKING_POINTS = 150  # Minimum points to continue tracking
+MAX_FB_ERROR = 1.5  # Forward-backward error threshold (pixels)
+LK_WIN_SIZE = (15, 15)  # LK window size
+LK_MAX_LEVEL = 4  # Pyramid levels
+LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 
 # EKF Configuration for homography stabilization
 EKF_ENABLED = True
@@ -1059,6 +1067,122 @@ def apply_person_occlusion(frame_with_logo: np.ndarray,
 
     return result_frame
 
+def track_keypoints_lk(prev_gray: np.ndarray,
+                      curr_gray: np.ndarray,
+                      prev_keypoints: np.ndarray,
+                      log_timing: bool = False) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Track keypoints using Lucas-Kanade optical flow with forward-backward consistency check.
+
+    Args:
+        prev_gray: Previous frame in grayscale
+        curr_gray: Current frame in grayscale
+        prev_keypoints: Previous keypoints as Nx2 array
+        log_timing: Whether to log processing time
+
+    Returns:
+        Tuple of (tracked_keypoints, good_mask, tracking_stats)
+    """
+    if log_timing:
+        t0 = time.time()
+
+    # Convert keypoints to the format expected by OpenCV (Nx1x2, float32)
+    p0 = prev_keypoints.reshape(-1, 1, 2).astype(np.float32)
+
+    # Forward tracking: prev_frame -> curr_frame
+    p1, st_forward, err_forward = cv2.calcOpticalFlowPyrLK(
+        prev_gray, curr_gray, p0,
+        nextPts=np.empty_like(p0),
+        winSize=LK_WIN_SIZE,
+        maxLevel=LK_MAX_LEVEL,
+        criteria=LK_CRITERIA
+    )
+
+    # Backward tracking: curr_frame -> prev_frame (for consistency check)
+    p0_back, st_backward, err_backward = cv2.calcOpticalFlowPyrLK(
+        curr_gray, prev_gray, p1,
+        nextPts=np.empty_like(p1),
+        winSize=LK_WIN_SIZE,
+        maxLevel=LK_MAX_LEVEL,
+        criteria=LK_CRITERIA
+    )
+
+    # Forward-backward consistency check
+    fb_error = np.linalg.norm(p0_back - p0, axis=2).flatten()
+
+    # Combine all quality checks
+    good_forward = st_forward.flatten() == 1
+    good_backward = st_backward.flatten() == 1
+    good_fb_error = fb_error < MAX_FB_ERROR
+
+    # Final good mask: all checks must pass
+    good_mask = good_forward & good_backward & good_fb_error
+
+    # Extract good tracked points
+    tracked_keypoints = p1[good_mask].reshape(-1, 2)
+
+    # Tracking statistics
+    tracking_stats = {
+        'total_points': len(prev_keypoints),
+        'tracked_points': len(tracked_keypoints),
+        'survival_rate': len(tracked_keypoints) / len(prev_keypoints) if len(prev_keypoints) > 0 else 0.0,
+        'avg_fb_error': np.mean(fb_error[good_mask]) if np.any(good_mask) else float('inf'),
+        'max_fb_error': np.max(fb_error[good_mask]) if np.any(good_mask) else float('inf')
+    }
+
+    if log_timing:
+        print(f"LK tracking completed in {time.time() - t0:.3f}s")
+        print(f"  Tracked {tracking_stats['tracked_points']}/{tracking_stats['total_points']} points ({tracking_stats['survival_rate']:.1%})")
+        print(f"  Avg FB error: {tracking_stats['avg_fb_error']:.2f}px")
+
+    return tracked_keypoints, good_mask, tracking_stats
+
+def should_reseed_keyframe(tracking_stats: dict, frame_count: int) -> tuple[bool, str]:
+    """
+    Determine if we should reseed with MatchAnything based on tracking quality.
+
+    Args:
+        tracking_stats: Statistics from LK tracking
+        frame_count: Current frame count since last keyframe
+
+    Returns:
+        Tuple of (should_reseed, reason)
+    """
+    # Regular keyframe interval
+    if frame_count >= KEYFRAME_INTERVAL:
+        return True, f"regular_interval_{KEYFRAME_INTERVAL}"
+
+    # Not enough tracking points survived
+    if tracking_stats['tracked_points'] < MIN_TRACKING_POINTS:
+        return True, f"insufficient_points_{tracking_stats['tracked_points']}"
+
+    # Poor survival rate (< 60%)
+    if tracking_stats['survival_rate'] < 0.6:
+        return True, f"poor_survival_{tracking_stats['survival_rate']:.1%}"
+
+    # High forward-backward error (> 1.5px average)
+    if tracking_stats['avg_fb_error'] > MAX_FB_ERROR:
+        return True, f"high_fb_error_{tracking_stats['avg_fb_error']:.2f}px"
+
+    return False, "continue_tracking"
+
+def filter_keypoints_for_tracking(keypoints: np.ndarray, max_points: int = 800) -> np.ndarray:
+    """
+    Filter keypoints to the strongest corners for better LK tracking.
+
+    Args:
+        keypoints: Input keypoints as Nx2 array
+        max_points: Maximum number of points to keep
+
+    Returns:
+        Filtered keypoints as Nx2 array
+    """
+    if len(keypoints) <= max_points:
+        return keypoints
+
+    # For now, just take the first max_points (could improve with corner strength)
+    return keypoints[:max_points]
+
 def map_budlight_to_spaten_coordinates(budlight_points: np.ndarray,
                                      center_x: int, center_y: int) -> np.ndarray:
     """
@@ -1292,19 +1416,16 @@ print("Simple frame-by-frame processing ready!")
 # Video processing parameters
 video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEncode_swappr_317.ts"
 
-# 01:26:05-01:26:17
-# 01:53:12-01:53:15
-# 00:50:42-00:50:48
-start_timestamp = "00:50:42" # "00:50:42"
-end_timestamp = "00:50:48" # "00:50:48"
+# Test segments with good logo visibility
+# 01:26:05-01:26:17 (good logo visibility)
+# 01:53:12-01:53:15 (shorter test)
+# 00:50:42-00:50:48 (stable scene)
+# 01:55:12-01:55:35 (longer test)
+# 00:50:42_00:50:48
+start_timestamp = "00:50:42"
+end_timestamp = "00:50:48"
 
-# 01:53:12-01:53:15
-# 02:07:04-02:07:14
-# 01:55:12-01:55:35
-start_timestamp = "01:55:12" # "00:50:42"
-end_timestamp = "01:55:35" # "00:50:48"
-
-output_video_path = f"swapped_{model_type}_simple_{start_timestamp}_{end_timestamp}.mp4"
+output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
 tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
 
@@ -1334,13 +1455,28 @@ out = cv2.VideoWriter(
 # Initialize debug visualizer
 debug_visualizer = DebugVisualizer(enable_debug=DEBUG)
 
-print(f"Starting simple frame-by-frame processing from frame {start_frame} to {end_frame}")
+# Tracking state variables for hybrid MA + LK approach
+tracking_state = {
+    'prev_frame_gray': None,
+    'prev_keypoints_physical': None,  # Physical logo keypoints (full frame coords)
+    'prev_keypoints_spaten': None,    # Corresponding SPATEN logo keypoints
+    'prev_bbox': None,                # Previous bounding box
+    'frame_count_since_keyframe': 0,  # Frames since last MA keyframe
+    'last_homography': None,          # Last successful homography for fallback
+    'is_tracking': False              # Whether we're currently tracking vs using MA
+}
+
+print(f"Starting hybrid MatchAnything + LK tracking from frame {start_frame} to {end_frame}")
 print(f"Video FPS: {video_fps}")
-print(f"Using MatchAnything {model_type} on every frame")
+print(f"Keyframe interval: every {KEYFRAME_INTERVAL} frames")
+print(f"Min tracking points: {MIN_TRACKING_POINTS}")
+print(f"Max forward-backward error: {MAX_FB_ERROR}px")
 print(f"Debug mode: {'ON' if DEBUG else 'OFF'}")
 
 # Performance tracking
 total_times = []
+ma_calls = 0  # Count MatchAnything calls
+lk_calls = 0  # Count LK tracking calls
 
 while video_stream.isOpened():
     start_time_frame: float = time.time()
@@ -1357,6 +1493,7 @@ while video_stream.isOpened():
 
     # Convert BGR to RGB for processing
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     result_frame = frame_rgb.copy()
     debug_info: Optional[dict] = None
 
@@ -1395,50 +1532,216 @@ while video_stream.isOpened():
                 best_idx = np.argmax(confidences_np)
                 budlight_bbox = boxes_np[best_idx]
                 best_confidence = confidences_np[best_idx]
-                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using highest confidence (conf={best_confidence:.3f})")
+                bbox_w = budlight_bbox[2] - budlight_bbox[0]
+                bbox_h = budlight_bbox[3] - budlight_bbox[1]
+                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using highest confidence (conf={best_confidence:.3f}, {bbox_w}x{bbox_h})")
             else:
                 # No confidence scores available, use the first detection
                 budlight_bbox = boxes_np[0]
-                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using first detection")
+                bbox_w = budlight_bbox[2] - budlight_bbox[0]
+                bbox_h = budlight_bbox[3] - budlight_bbox[1]
+                print(f"Frame {current_frame_number}: Detected {boxes_np.shape[0]} Budlight logos, using first detection ({bbox_w}x{bbox_h})")
         else:
             # Single detection or squeeze to 1D
             budlight_bbox = boxes_np.squeeze()
-            print(f"Frame {current_frame_number}: Detected Budlight logo")
+            bbox_w = budlight_bbox[2] - budlight_bbox[0]
+            bbox_h = budlight_bbox[3] - budlight_bbox[1]
+            print(f"Frame {current_frame_number}: Detected Budlight logo ({bbox_w}x{bbox_h})")
 
         # Ensure budlight_bbox is 1D array with 4 elements
         if budlight_bbox.shape != (4,):
             print(f"Frame {current_frame_number}: Invalid bounding box shape {budlight_bbox.shape}, expected (4,)")
             print(f"Frame {current_frame_number}: ❌ Bounding box extraction failed")
+            # Reset tracking state on invalid detection
+            tracking_state['is_tracking'] = False
+            tracking_state['frame_count_since_keyframe'] = 0
             current_frame_number += 1
             continue
-        #bbox_w = budlight_bbox[2] - budlight_bbox[0]  # x2 - x1
-        #bbox_h = budlight_bbox[3] - budlight_bbox[1]  # y2 - y1
 
-        #if bbox_w < MIN_BBOX_W:
-        #    print(f"Frame {current_frame_number}: ❌ Bounding box width too small")
-        #    current_frame_number += 1
-        #    continue
+        # Calculate bbox dimensions for validation (recalculate to ensure consistency)
+        bbox_w = budlight_bbox[2] - budlight_bbox[0]  # x2 - x1
+        bbox_h = budlight_bbox[3] - budlight_bbox[1]  # y2 - y1
 
-        #if bbox_h < MIN_BBOX_H:
-        #    print(f"Frame {current_frame_number}: ❌ Bounding box height too small")
-        #    current_frame_number += 1
-        #    continue
+        if bbox_w < MIN_BBOX_W:
+            print(f"Frame {current_frame_number}: ❌ Bounding box width too small ({bbox_w} < {MIN_BBOX_W})")
+            # Reset tracking state on invalid detection
+            tracking_state['is_tracking'] = False
+            tracking_state['frame_count_since_keyframe'] = 0
+            current_frame_number += 1
+            continue
 
+        if bbox_h < MIN_BBOX_H:
+            print(f"Frame {current_frame_number}: ❌ Bounding box height too small ({bbox_h} < {MIN_BBOX_H})")
+            # Reset tracking state on invalid detection
+            tracking_state['is_tracking'] = False
+            tracking_state['frame_count_since_keyframe'] = 0
+            current_frame_number += 1
+            continue
 
-        # Replace logo using simple frame-by-frame approach
-        result_frame, debug_info = replace_logo_in_frame(
-            frame_rgb,
-            budlight_bbox,
-            model,
-            preprocessing_conf,
-            homography_ekf,
-            expansion_factor=0.1,
-            collect_debug_info=DEBUG
-        )
+        # Decide whether to use MatchAnything or LK tracking
+        use_matchanything = False
+        reseed_reason = "first_frame"
+
+        if not tracking_state['is_tracking'] or tracking_state['prev_frame_gray'] is None:
+            # First frame or tracking was reset
+            use_matchanything = True
+            reseed_reason = "first_frame_or_reset"
+        elif tracking_state['prev_keypoints_physical'] is not None and len(tracking_state['prev_keypoints_physical']) > 0:
+            # We have previous keypoints, try LK tracking first
+            tracked_keypoints, good_mask, tracking_stats = track_keypoints_lk(
+                tracking_state['prev_frame_gray'],
+                frame_gray,
+                tracking_state['prev_keypoints_physical'],
+                log_timing=False
+            )
+
+            # Check if we should reseed with MatchAnything
+            should_reseed, reseed_reason = should_reseed_keyframe(
+                tracking_stats, tracking_state['frame_count_since_keyframe']
+            )
+
+            if should_reseed:
+                use_matchanything = True
+                print(f"Frame {current_frame_number}: 🔄 Reseeding with MatchAnything - {reseed_reason}")
+            else:
+                # Continue with LK tracking
+                use_matchanything = False
+                # Update tracking state
+                tracking_state['prev_keypoints_physical'] = tracked_keypoints
+                # Update corresponding SPATEN keypoints (maintain the same valid points)
+                if tracking_state['prev_keypoints_spaten'] is not None:
+                    tracking_state['prev_keypoints_spaten'] = tracking_state['prev_keypoints_spaten'][good_mask]
+
+                lk_calls += 1
+                print(f"Frame {current_frame_number}: 🎯 LK tracking - {tracking_stats['tracked_points']} points, {tracking_stats['survival_rate']:.1%} survival")
+        else:
+            # No previous keypoints available
+            use_matchanything = True
+            reseed_reason = "no_previous_keypoints"
+
+        if use_matchanything:
+            # Use full MatchAnything pipeline
+            result_frame, debug_info = replace_logo_in_frame(
+                frame_rgb,
+                budlight_bbox,
+                model,
+                preprocessing_conf,
+                homography_ekf,
+                expansion_factor=0.1,
+                collect_debug_info=DEBUG
+            )
+
+            # Extract keypoints for future tracking
+            if debug_info and 'filtered_match_keypoints1' in debug_info and 'filtered_match_keypoints2' in debug_info:
+                # Get keypoints in full frame coordinates (already transformed in replace_logo_in_frame)
+                if 'filtered_keypoints' in debug_info:
+                    physical_keypoints_full = debug_info['filtered_keypoints']
+                    # Filter keypoints for better LK tracking
+                    physical_keypoints_filtered = filter_keypoints_for_tracking(physical_keypoints_full, max_points=800)
+
+                    # Get corresponding SPATEN keypoints
+                    budlight_keypoints = debug_info['filtered_match_keypoints2']  # In Budlight logo space
+                    spaten_keypoints = map_budlight_to_spaten_coordinates(budlight_keypoints, center_x, center_y)
+
+                    # Filter SPATEN keypoints to match the filtered physical keypoints
+                    if len(spaten_keypoints) > len(physical_keypoints_filtered):
+                        spaten_keypoints = spaten_keypoints[:len(physical_keypoints_filtered)]
+
+                    # Update tracking state
+                    tracking_state['prev_keypoints_physical'] = physical_keypoints_filtered
+                    tracking_state['prev_keypoints_spaten'] = spaten_keypoints
+                    tracking_state['is_tracking'] = True
+                    tracking_state['frame_count_since_keyframe'] = 0
+
+                    print(f"Frame {current_frame_number}: 🎯 MA keyframe - extracted {len(physical_keypoints_filtered)} points for tracking")
+                else:
+                    tracking_state['is_tracking'] = False
+            else:
+                tracking_state['is_tracking'] = False
+
+            ma_calls += 1
+            print(f"Frame {current_frame_number}: 🔍 MatchAnything - {reseed_reason}")
+        else:
+            # Use LK tracking result to compute homography and replace logo
+            if len(tracking_state['prev_keypoints_physical']) >= MIN_KP_FOR_HOMOGRAPHY and len(tracking_state['prev_keypoints_spaten']) >= MIN_KP_FOR_HOMOGRAPHY:
+                # Compute homography using tracked keypoints
+                H_spaten, mask = cv2.findHomography(
+                    tracking_state['prev_keypoints_spaten'],  # Source: SPATEN coordinates
+                    tracking_state['prev_keypoints_physical'],  # Target: full frame coordinates
+                    cv2.USAC_MAGSAC,
+                    ransacReprojThreshold=RANSAC_THRESHOLD,
+                    confidence=0.999,
+                    maxIters=10000
+                )
+
+                if H_spaten is not None:
+                    # Apply EKF stabilization
+                    if homography_ekf is not None:
+                        H_spaten = homography_ekf.update(H_spaten)
+
+                    # Store for potential fallback
+                    tracking_state['last_homography'] = H_spaten
+
+                    # Warp and replace logo using the computed homography
+                    frame_h, frame_w = frame_rgb.shape[:2]
+
+                    if is_transparent:
+                        spaten_warped = cv2.warpPerspective(
+                            spaten_resized[:,:,:3],  # Remove alpha channel for warping
+                            H_spaten,
+                            (frame_w, frame_h)
+                        )
+                        spaten_alpha_warped = cv2.warpPerspective(
+                            spaten_resized[:,:,3],  # Alpha channel only
+                            H_spaten,
+                            (frame_w, frame_h)
+                        )
+                        mask = spaten_alpha_warped > 0
+                    else:
+                        spaten_warped = cv2.warpPerspective(
+                            spaten_resized,
+                            H_spaten,
+                            (frame_w, frame_h)
+                        )
+                        spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
+                        mask = spaten_gray > 0
+
+                    mask_3d = np.stack([mask, mask, mask], axis=-1)
+
+                    # Replace logo in frame
+                    frame_with_logo = frame_rgb.copy()
+                    frame_with_logo[mask_3d] = spaten_warped[mask_3d]
+
+                    # Apply person occlusion
+                    person_mask = get_person_masks(frame_rgb, person_seg_model, confidence_threshold=0.5, log_timing=False)
+                    result_frame = apply_person_occlusion(frame_with_logo, frame_rgb, person_mask, log_timing=False)
+
+                    if DEBUG:
+                        # Prepare debug info for LK tracking frames
+                        debug_info = {
+                            'bbox': budlight_bbox,
+                            'filtered_keypoints': tracking_state['prev_keypoints_physical'],
+                            'person_mask': person_mask,
+                            'stats': tracking_stats
+                        }
+                else:
+                    print(f"Frame {current_frame_number}: ❌ LK homography computation failed")
+                    result_frame = frame_rgb  # Use original frame
+            else:
+                print(f"Frame {current_frame_number}: ❌ Not enough LK points for homography")
+                result_frame = frame_rgb  # Use original frame
+
+        # Update tracking state
+        tracking_state['prev_frame_gray'] = frame_gray.copy()
+        tracking_state['prev_bbox'] = budlight_bbox
+        tracking_state['frame_count_since_keyframe'] += 1
 
         print(f"Frame {current_frame_number}: ✅ Logo processing completed")
     else:
         print(f"Frame {current_frame_number}: No Budlight logo detected")
+        # Reset tracking state when no logo is detected
+        tracking_state['is_tracking'] = False
+        tracking_state['frame_count_since_keyframe'] = 0
 
     # Convert result frame back to BGR for video writing
     result_frame_bgr = cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR)
@@ -1470,15 +1773,20 @@ out.release()
 debug_visualizer.close()
 
 print("\n" + "="*50)
-print("SIMPLE FRAME-BY-FRAME PERFORMANCE STATISTICS")
+print("HYBRID MATCHANYTHING + LK TRACKING PERFORMANCE STATISTICS")
 print("="*50)
 
 if total_times:
     avg_frame_time = np.mean(total_times)
     avg_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+    total_frames = len(total_times)
+
     print(f"Average frame time: {avg_frame_time:.3f}s")
     print(f"Average FPS: {avg_fps:.1f}")
-    print(f"Total frames processed: {len(total_times)}")
-    print(f"MatchAnything calls per frame: 1 (when logo detected)")
+    print(f"Total frames processed: {total_frames}")
+    print(f"MatchAnything calls: {ma_calls} ({ma_calls/total_frames:.1%} of frames)")
+    print(f"LK tracking calls: {lk_calls} ({lk_calls/total_frames:.1%} of frames)")
+    print(f"Efficiency improvement: {(total_frames-ma_calls)/total_frames:.1%} frames used lightweight LK tracking")
+    print(f"Expected speedup vs full MA: ~{total_frames/max(ma_calls,1):.1f}x (theoretical)")
 
-print("Simple frame-by-frame video processing completed!")
+print("Hybrid MatchAnything + LK tracking video processing completed!")
