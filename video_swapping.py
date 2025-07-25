@@ -806,6 +806,9 @@ LK_WIN_SIZE = (15, 15)  # LK window size
 LK_MAX_LEVEL = 3  # Pyramid levels
 LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 
+# Robust fallback configuration
+MAX_FRAMES_NO_DETECT_TO_STOP = 5  # Stop swapping after N consecutive frames without logo detection
+
 # EKF Configuration for homography stabilization
 EKF_ENABLED = True
 EKF_PROCESS_NOISE_STD = 0.05    # Lower = smoother but slower response
@@ -1654,6 +1657,9 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 # 00:50:42_00:50:48 (good conditions)
 # 35:39-00:35:43
 
+start_timestamp = "00:50:42"
+end_timestamp = "00:50:48"
+
 start_timestamp = "01:55:12"
 end_timestamp = "01:55:51"
 
@@ -1661,7 +1667,7 @@ start_timestamp = "00:35:39"
 end_timestamp = "00:36:05"
 
 start_timestamp = "00:50:42"
-end_timestamp = "00:50:48"
+end_timestamp = "00:51:28"
 
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
@@ -1701,7 +1707,8 @@ tracking_state = {
     'prev_bbox': None,                # Previous bounding box
     'frame_count_since_keyframe': 0,  # Frames since last MA keyframe
     'last_homography': None,          # Last successful homography for fallback
-    'is_tracking': False              # Whether we're currently tracking vs using MA
+    'is_tracking': False,             # Whether we're currently tracking vs using MA
+    'consecutive_no_detect_count': 0  # Count of consecutive frames without logo detection
 }
 
 print(f"Starting hybrid MatchAnything + LK tracking from frame {start_frame} to {end_frame}")
@@ -1709,6 +1716,7 @@ print(f"Video FPS: {video_fps}")
 print(f"Keyframe interval: every {KEYFRAME_INTERVAL} frames")
 print(f"Min tracking points: {MIN_TRACKING_POINTS}")
 print(f"Max forward-backward error: {MAX_FB_ERROR}px")
+print(f"Max consecutive frames without detection: {MAX_FRAMES_NO_DETECT_TO_STOP}")
 print(f"Debug mode: {'ON' if DEBUG else 'OFF'}")
 
 # Performance tracking
@@ -1809,6 +1817,24 @@ while video_stream.isOpened():
     else:
         budlight_bbox = None
 
+    # Update consecutive no-detection counter
+    if budlight_bbox is not None:
+        # Logo detected - reset the consecutive no-detection counter
+        tracking_state['consecutive_no_detect_count'] = 0
+    else:
+        # No logo detected - increment the consecutive no-detection counter
+        tracking_state['consecutive_no_detect_count'] += 1
+
+        # Check if we've exceeded the maximum consecutive frames without detection
+        if tracking_state['consecutive_no_detect_count'] > MAX_FRAMES_NO_DETECT_TO_STOP:
+            print(f"Frame {current_frame_number}: ❌ Stopping logo replacement after {tracking_state['consecutive_no_detect_count']} consecutive frames without detection")
+            # Reset tracking state and skip processing
+            tracking_state['is_tracking'] = False
+            tracking_state['frame_count_since_keyframe'] = 0
+            tracking_state['consecutive_no_detect_count'] = 0
+            current_frame_number += 1
+            continue
+
     # Check if we can continue with LK tracking even without detection
     can_continue_with_lk = (
         tracking_state['is_tracking'] and
@@ -1822,7 +1848,7 @@ while video_stream.isOpened():
     # Decision logic: Continue processing if we have detection OR can continue with LK
     if budlight_bbox is not None or can_continue_with_lk:
         if budlight_bbox is None:
-            print(f"Frame {current_frame_number}: No detection, but continuing with LK tracking ({len(tracking_state['prev_keypoints_physical'])} points)")
+            print(f"Frame {current_frame_number}: No detection ({tracking_state['consecutive_no_detect_count']}/{MAX_FRAMES_NO_DETECT_TO_STOP}), but continuing with LK tracking ({len(tracking_state['prev_keypoints_physical'])} points)")
             # Use previous bbox for any bbox-dependent operations
             budlight_bbox = tracking_state.get('prev_bbox')
 
@@ -2096,7 +2122,7 @@ while video_stream.isOpened():
         if DEBUG_VERBOSE:
             print(f"Frame {current_frame_number}: ✅ Logo processing completed")
     else:
-        print(f"Frame {current_frame_number}: ❌ No detection and insufficient LK tracking - stopping logo replacement")
+        print(f"Frame {current_frame_number}: ❌ No detection for {tracking_state['consecutive_no_detect_count']} consecutive frames and insufficient LK tracking - stopping logo replacement")
         # Only reset tracking state when both detection fails AND LK tracking is insufficient
         tracking_state['is_tracking'] = False
         tracking_state['frame_count_since_keyframe'] = 0
