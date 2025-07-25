@@ -628,9 +628,11 @@ MIN_BBOX_H = 50
 RANSAC_THRESHOLD = 30
 DEBUG = True
 
+CONF_THR_LOGO_DETECTOR = 0.6
+
 # Optical Flow Tracking Configuration
 KEYFRAME_INTERVAL = 60  # Run MatchAnything every N frames
-MIN_TRACKING_POINTS = 150  # Minimum points to continue tracking
+MIN_TRACKING_POINTS = 250  # Minimum points to continue tracking
 MAX_FB_ERROR = 1.0  # Forward-backward error threshold (pixels) - stricter for better quality
 LK_WIN_SIZE = (15, 15)  # LK window size
 LK_MAX_LEVEL = 3  # Pyramid levels
@@ -638,8 +640,8 @@ LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 
 # EKF Configuration for homography stabilization
 EKF_ENABLED = True
-EKF_PROCESS_NOISE_STD = 0.01    # Lower = smoother but slower response
-EKF_MEASUREMENT_NOISE_STD = 0.1   # Lower = trust measurements more
+EKF_PROCESS_NOISE_STD = 0.05    # Lower = smoother but slower response
+EKF_MEASUREMENT_NOISE_STD = 0.01   # Lower = trust measurements more
 EKF_INITIAL_COVARIANCE = 0.1     # Initial uncertainty
 
 # Load overlay components
@@ -1067,6 +1069,48 @@ def apply_person_occlusion(frame_with_logo: np.ndarray,
 
     return result_frame
 
+def filter_keypoints_by_person_mask(keypoints: np.ndarray,
+                                   person_mask: np.ndarray,
+                                   log_timing: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Filter out keypoints that overlap with person masks to avoid tracking people instead of logo.
+
+    Args:
+        keypoints: Array of keypoints as Nx2 (x, y) coordinates
+        person_mask: Binary person mask (same size as frame)
+        log_timing: Whether to log processing time
+
+    Returns:
+        Tuple of (filtered_keypoints, valid_mask) where valid_mask indicates which keypoints survived
+    """
+    if log_timing:
+        t0 = time.time()
+
+    if len(keypoints) == 0 or person_mask is None:
+        return keypoints, np.ones(len(keypoints), dtype=bool)
+
+    # Check which keypoints fall inside person regions
+    valid_mask = np.ones(len(keypoints), dtype=bool)
+
+    for i, (x, y) in enumerate(keypoints):
+        # Convert to integer coordinates and clamp to image bounds
+        x_int = int(np.clip(x, 0, person_mask.shape[1] - 1))
+        y_int = int(np.clip(y, 0, person_mask.shape[0] - 1))
+
+        # Check if this point is inside a person region
+        if person_mask[y_int, x_int] > 0:
+            valid_mask[i] = False
+
+    # Filter keypoints
+    filtered_keypoints = keypoints[valid_mask]
+
+    if log_timing:
+        removed_count = len(keypoints) - len(filtered_keypoints)
+        print(f"Person mask filtering completed in {time.time() - t0:.3f}s")
+        print(f"  Removed {removed_count}/{len(keypoints)} keypoints that overlap with people")
+
+    return filtered_keypoints, valid_mask
+
 def track_keypoints_lk(prev_gray: np.ndarray,
                       curr_gray: np.ndarray,
                       prev_keypoints: np.ndarray,
@@ -1142,7 +1186,7 @@ def should_reseed_keyframe(tracking_stats: dict, frame_count: int) -> tuple[bool
     Determine if we should reseed with MatchAnything based on tracking quality.
 
     Args:
-        tracking_stats: Statistics from LK tracking
+        tracking_stats: Statistics from LK tracking including person mask filtering
         frame_count: Current frame count since last keyframe
 
     Returns:
@@ -1152,17 +1196,31 @@ def should_reseed_keyframe(tracking_stats: dict, frame_count: int) -> tuple[bool
     if frame_count >= KEYFRAME_INTERVAL:
         return True, f"regular_interval_{KEYFRAME_INTERVAL}"
 
+    # Check final tracked points after person filtering if available
+    final_points = tracking_stats.get('tracked_points_after_person_filter', tracking_stats['tracked_points'])
+
     # Not enough tracking points survived
-    if tracking_stats['tracked_points'] < MIN_TRACKING_POINTS:
-        return True, f"insufficient_points_{tracking_stats['tracked_points']}"
+    if final_points < MIN_TRACKING_POINTS:
+        return True, f"insufficient_final_points_{final_points}"
 
-    # Poor survival rate (< 60%)
+    # Poor LK survival rate (< 60%)
     if tracking_stats['survival_rate'] < 0.6:
-        return True, f"poor_survival_{tracking_stats['survival_rate']:.1%}"
+        return True, f"poor_lk_survival_{tracking_stats['survival_rate']:.1%}"
 
-    # High forward-backward error (> 1.5px average)
+    # Poor person mask survival rate (< 40% - indicates heavy person occlusion)
+    if 'person_mask_survival_rate' in tracking_stats and tracking_stats['person_mask_survival_rate'] < 0.4:
+        return True, f"heavy_person_occlusion_{tracking_stats['person_mask_survival_rate']:.1%}"
+
+    # High forward-backward error (> 1.0px average)
     if tracking_stats['avg_fb_error'] > MAX_FB_ERROR:
         return True, f"high_fb_error_{tracking_stats['avg_fb_error']:.2f}px"
+
+    # Too many points removed by person mask (> 60% of LK-valid points)
+    if 'removed_by_person_mask' in tracking_stats and 'tracked_points' in tracking_stats:
+        lk_valid_points = tracking_stats['tracked_points']
+        removed_by_person = tracking_stats['removed_by_person_mask']
+        if lk_valid_points > 0 and removed_by_person / lk_valid_points > 0.6:
+            return True, f"excessive_person_occlusion_{removed_by_person}/{lk_valid_points}"
 
     return False, "continue_tracking"
 
@@ -1430,7 +1488,7 @@ start_timestamp = "00:50:42"
 end_timestamp = "00:50:48"
 
 start_timestamp = "01:55:12"
-end_timestamp = "01:55:35"
+end_timestamp = "01:55:51"
 
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
@@ -1506,7 +1564,7 @@ while video_stream.isOpened():
 
     # Detect Budlight logo
     results: list[Results] = det_model_budlight.track(
-        frame, conf=0.8,
+        frame, conf=CONF_THR_LOGO_DETECTOR,
         persist=True,
         tracker=tracker_config_path,
         stream=False,
@@ -1559,31 +1617,38 @@ while video_stream.isOpened():
         if budlight_bbox.shape != (4,):
             print(f"Frame {current_frame_number}: Invalid bounding box shape {budlight_bbox.shape}, expected (4,)")
             print(f"Frame {current_frame_number}: ❌ Bounding box extraction failed")
-            # Reset tracking state on invalid detection
-            tracking_state['is_tracking'] = False
-            tracking_state['frame_count_since_keyframe'] = 0
-            current_frame_number += 1
-            continue
+            budlight_bbox = None
+        else:
+            # Calculate bbox dimensions for validation (recalculate to ensure consistency)
+            bbox_w = budlight_bbox[2] - budlight_bbox[0]  # x2 - x1
+            bbox_h = budlight_bbox[3] - budlight_bbox[1]  # y2 - y1
 
-        # Calculate bbox dimensions for validation (recalculate to ensure consistency)
-        bbox_w = budlight_bbox[2] - budlight_bbox[0]  # x2 - x1
-        bbox_h = budlight_bbox[3] - budlight_bbox[1]  # y2 - y1
+            if bbox_w < MIN_BBOX_W:
+                print(f"Frame {current_frame_number}: ❌ Bounding box width too small ({bbox_w} < {MIN_BBOX_W})")
+                budlight_bbox = None
 
-        if bbox_w < MIN_BBOX_W:
-            print(f"Frame {current_frame_number}: ❌ Bounding box width too small ({bbox_w} < {MIN_BBOX_W})")
-            # Reset tracking state on invalid detection
-            tracking_state['is_tracking'] = False
-            tracking_state['frame_count_since_keyframe'] = 0
-            current_frame_number += 1
-            continue
+            if bbox_h < MIN_BBOX_H:
+                print(f"Frame {current_frame_number}: ❌ Bounding box height too small ({bbox_h} < {MIN_BBOX_H})")
+                budlight_bbox = None
+    else:
+        budlight_bbox = None
 
-        if bbox_h < MIN_BBOX_H:
-            print(f"Frame {current_frame_number}: ❌ Bounding box height too small ({bbox_h} < {MIN_BBOX_H})")
-            # Reset tracking state on invalid detection
-            tracking_state['is_tracking'] = False
-            tracking_state['frame_count_since_keyframe'] = 0
-            current_frame_number += 1
-            continue
+    # Check if we can continue with LK tracking even without detection
+    can_continue_with_lk = (
+        tracking_state['is_tracking'] and
+        tracking_state['prev_keypoints_physical'] is not None and
+        tracking_state['prev_keypoints_spaten'] is not None and
+        len(tracking_state['prev_keypoints_physical']) >= MIN_KP_FOR_HOMOGRAPHY and
+        len(tracking_state['prev_keypoints_spaten']) >= MIN_KP_FOR_HOMOGRAPHY and
+        tracking_state['prev_frame_gray'] is not None
+    )
+
+    # Decision logic: Continue processing if we have detection OR can continue with LK
+    if budlight_bbox is not None or can_continue_with_lk:
+        if budlight_bbox is None:
+            print(f"Frame {current_frame_number}: No detection, but continuing with LK tracking ({len(tracking_state['prev_keypoints_physical'])} points)")
+            # Use previous bbox for any bbox-dependent operations
+            budlight_bbox = tracking_state.get('prev_bbox')
 
         # Decide whether to use MatchAnything or LK tracking
         use_matchanything = False
@@ -1591,9 +1656,17 @@ while video_stream.isOpened():
         lk_failed = False  # Track if LK tracking failed
 
         if not tracking_state['is_tracking'] or tracking_state['prev_frame_gray'] is None:
-            # First frame or tracking was reset
-            use_matchanything = True
-            reseed_reason = "first_frame_or_reset"
+            # First frame or tracking was reset - need detection for MatchAnything
+            if budlight_bbox is not None:
+                use_matchanything = True
+                reseed_reason = "first_frame_or_reset"
+            else:
+                print(f"Frame {current_frame_number}: ❌ No detection and no tracking state - cannot process")
+                # Reset tracking state
+                tracking_state['is_tracking'] = False
+                tracking_state['frame_count_since_keyframe'] = 0
+                current_frame_number += 1
+                continue
         elif tracking_state['prev_keypoints_physical'] is not None and len(tracking_state['prev_keypoints_physical']) > 0:
             # We have previous keypoints, try LK tracking first
             tracked_keypoints, good_mask, tracking_stats = track_keypoints_lk(
@@ -1603,39 +1676,94 @@ while video_stream.isOpened():
                 log_timing=False
             )
 
+            # Filter out keypoints that overlap with people to avoid tracking people instead of logo
+            person_mask = get_person_masks(
+                frame_rgb,
+                person_seg_model,
+                confidence_threshold=0.5,
+                log_timing=False
+            )
+
+            # Apply person mask filtering
+            person_filtered_keypoints, person_mask_valid = filter_keypoints_by_person_mask(
+                tracked_keypoints,
+                person_mask,
+                log_timing=False
+            )
+
+            # Combine LK good_mask with person mask filtering
+            # We need to map the person_mask_valid back to the original keypoint indices
+            combined_good_mask = np.zeros(len(tracking_state['prev_keypoints_physical']), dtype=bool)
+            combined_good_mask[good_mask] = person_mask_valid  # Apply person filtering only to LK-valid points
+
+            # Update tracking stats to reflect person mask filtering
+            tracking_stats['tracked_points_after_person_filter'] = len(person_filtered_keypoints)
+            tracking_stats['removed_by_person_mask'] = np.sum(good_mask) - len(person_filtered_keypoints)
+            tracking_stats['person_mask_survival_rate'] = len(person_filtered_keypoints) / np.sum(good_mask) if np.sum(good_mask) > 0 else 0.0
+
+            print(f"Frame {current_frame_number}: LK tracking: {np.sum(good_mask)} → {len(person_filtered_keypoints)} points after person mask filtering")
+
             # Check if we should reseed with MatchAnything
             should_reseed, reseed_reason = should_reseed_keyframe(
                 tracking_stats, tracking_state['frame_count_since_keyframe']
             )
 
             if should_reseed:
-                use_matchanything = True
-                print(f"Frame {current_frame_number}: 🔄 Reseeding with MatchAnything - {reseed_reason}")
-            else:
-                # Check if we have enough points for homography computation
-                if len(tracked_keypoints) < MIN_KP_FOR_HOMOGRAPHY:
+                # Need MatchAnything but check if we have detection
+                if budlight_bbox is not None:
                     use_matchanything = True
-                    lk_failed = True
-                    reseed_reason = f"insufficient_LK_points_{len(tracked_keypoints)}"
-                    print(f"Frame {current_frame_number}: 🔄 LK failed - not enough points for homography ({len(tracked_keypoints)} < {MIN_KP_FOR_HOMOGRAPHY})")
+                    print(f"Frame {current_frame_number}: 🔄 Reseeding with MatchAnything - {reseed_reason}")
                 else:
-                    # Update tracking state for successful LK tracking
-                    tracking_state['prev_keypoints_physical'] = tracked_keypoints
-                    # Update corresponding SPATEN keypoints (maintain the same valid points)
+                    print(f"Frame {current_frame_number}: 🔄 Need reseeding but no detection - trying to continue with current LK tracking")
+                    # Try to continue with current tracking if we still have enough points after person filtering
+                    if len(person_filtered_keypoints) >= MIN_KP_FOR_HOMOGRAPHY:
+                        use_matchanything = False
+                        print(f"Frame {current_frame_number}: 🎯 Continuing with degraded LK tracking - {len(person_filtered_keypoints)} points")
+                    else:
+                        print(f"Frame {current_frame_number}: ❌ Insufficient LK points after person filtering and no detection - stopping replacement")
+                        tracking_state['is_tracking'] = False
+                        tracking_state['frame_count_since_keyframe'] = 0
+                        current_frame_number += 1
+                        continue
+            else:
+                # Check if we have enough points for homography computation after person filtering
+                if len(person_filtered_keypoints) < MIN_KP_FOR_HOMOGRAPHY:
+                    if budlight_bbox is not None:
+                        use_matchanything = True
+                        lk_failed = True
+                        reseed_reason = f"insufficient_LK_points_after_person_filter_{len(person_filtered_keypoints)}"
+                        print(f"Frame {current_frame_number}: 🔄 LK failed - not enough points for homography after person filtering ({len(person_filtered_keypoints)} < {MIN_KP_FOR_HOMOGRAPHY})")
+                    else:
+                        print(f"Frame {current_frame_number}: ❌ Insufficient LK points after person filtering and no detection - stopping replacement")
+                        tracking_state['is_tracking'] = False
+                        tracking_state['frame_count_since_keyframe'] = 0
+                        current_frame_number += 1
+                        continue
+                else:
+                    # Update tracking state for successful LK tracking with person-filtered keypoints
+                    tracking_state['prev_keypoints_physical'] = person_filtered_keypoints
+                    # Update corresponding SPATEN keypoints using the combined mask
                     if tracking_state['prev_keypoints_spaten'] is not None:
-                        tracking_state['prev_keypoints_spaten'] = tracking_state['prev_keypoints_spaten'][good_mask]
+                        tracking_state['prev_keypoints_spaten'] = tracking_state['prev_keypoints_spaten'][combined_good_mask]
 
                     # Check if we still have enough SPATEN points
                     if len(tracking_state['prev_keypoints_spaten']) < MIN_KP_FOR_HOMOGRAPHY:
-                        use_matchanything = True
-                        lk_failed = True
-                        reseed_reason = f"insufficient_SPATEN_points_{len(tracking_state['prev_keypoints_spaten'])}"
-                        print(f"Frame {current_frame_number}: 🔄 LK failed - not enough SPATEN points for homography")
+                        if budlight_bbox is not None:
+                            use_matchanything = True
+                            lk_failed = True
+                            reseed_reason = f"insufficient_SPATEN_points_after_person_filter_{len(tracking_state['prev_keypoints_spaten'])}"
+                            print(f"Frame {current_frame_number}: 🔄 LK failed - not enough SPATEN points for homography after person filtering")
+                        else:
+                            print(f"Frame {current_frame_number}: ❌ Insufficient SPATEN points after person filtering and no detection - stopping replacement")
+                            tracking_state['is_tracking'] = False
+                            tracking_state['frame_count_since_keyframe'] = 0
+                            current_frame_number += 1
+                            continue
                     else:
-                        # Try to compute homography
+                        # Try to compute homography using person-filtered keypoints
                         H_spaten, mask = cv2.findHomography(
                             tracking_state['prev_keypoints_spaten'],  # Source: SPATEN coordinates
-                            tracking_state['prev_keypoints_physical'],  # Target: full frame coordinates
+                            tracking_state['prev_keypoints_physical'],  # Target: full frame coordinates (person-filtered)
                             cv2.USAC_MAGSAC,
                             ransacReprojThreshold=RANSAC_THRESHOLD,
                             confidence=0.999,
@@ -1643,19 +1771,33 @@ while video_stream.isOpened():
                         )
 
                         if H_spaten is None:
-                            use_matchanything = True
-                            lk_failed = True
-                            reseed_reason = "LK_homography_computation_failed"
-                            print(f"Frame {current_frame_number}: 🔄 LK failed - homography computation failed")
+                            if budlight_bbox is not None:
+                                use_matchanything = True
+                                lk_failed = True
+                                reseed_reason = "LK_homography_computation_failed_after_person_filter"
+                                print(f"Frame {current_frame_number}: 🔄 LK failed - homography computation failed after person filtering")
+                            else:
+                                print(f"Frame {current_frame_number}: ❌ LK homography failed after person filtering and no detection - stopping replacement")
+                                tracking_state['is_tracking'] = False
+                                tracking_state['frame_count_since_keyframe'] = 0
+                                current_frame_number += 1
+                                continue
                         else:
-                            # LK tracking successful, continue with tracked points
+                            # LK tracking successful with person filtering, continue with tracked points
                             use_matchanything = False
                             lk_calls += 1
-                            print(f"Frame {current_frame_number}: 🎯 LK tracking - {tracking_stats['tracked_points']} points, {tracking_stats['survival_rate']:.1%} survival")
+                            print(f"Frame {current_frame_number}: 🎯 LK tracking with person filtering - {len(person_filtered_keypoints)} points, {tracking_stats['person_mask_survival_rate']:.1%} survived person filter")
         else:
-            # No previous keypoints available
-            use_matchanything = True
-            reseed_reason = "no_previous_keypoints"
+            # No previous keypoints available - need MatchAnything with detection
+            if budlight_bbox is not None:
+                use_matchanything = True
+                reseed_reason = "no_previous_keypoints"
+            else:
+                print(f"Frame {current_frame_number}: ❌ No previous keypoints and no detection - cannot process")
+                tracking_state['is_tracking'] = False
+                tracking_state['frame_count_since_keyframe'] = 0
+                current_frame_number += 1
+                continue
 
         # Reset tracking state if LK failed to force MatchAnything
         if lk_failed:
@@ -1663,7 +1805,14 @@ while video_stream.isOpened():
             tracking_state['frame_count_since_keyframe'] = 0
 
         if use_matchanything:
-            # Use full MatchAnything pipeline
+            # Use full MatchAnything pipeline (requires detection)
+            if budlight_bbox is None:
+                print(f"Frame {current_frame_number}: ❌ MatchAnything needed but no detection available")
+                tracking_state['is_tracking'] = False
+                tracking_state['frame_count_since_keyframe'] = 0
+                current_frame_number += 1
+                continue
+
             result_frame, debug_info = replace_logo_in_frame(
                 frame_rgb,
                 budlight_bbox,
@@ -1751,20 +1900,25 @@ while video_stream.isOpened():
                 # Prepare debug info for LK tracking frames
                 debug_info = {
                     'bbox': budlight_bbox,
-                    'filtered_keypoints': tracking_state['prev_keypoints_physical'],
+                    'filtered_keypoints': tracking_state['prev_keypoints_physical'],  # These are already person-filtered
                     'person_mask': person_mask,
-                    'stats': tracking_stats
+                    'stats': {
+                        **tracking_stats,
+                        'used_person_filtering': True,
+                        'final_points_after_person_filter': len(tracking_state['prev_keypoints_physical'])
+                    }
                 }
 
         # Update tracking state
         tracking_state['prev_frame_gray'] = frame_gray.copy()
-        tracking_state['prev_bbox'] = budlight_bbox
+        if budlight_bbox is not None:
+            tracking_state['prev_bbox'] = budlight_bbox
         tracking_state['frame_count_since_keyframe'] += 1
 
         print(f"Frame {current_frame_number}: ✅ Logo processing completed")
     else:
-        print(f"Frame {current_frame_number}: No Budlight logo detected")
-        # Reset tracking state when no logo is detected
+        print(f"Frame {current_frame_number}: ❌ No detection and insufficient LK tracking - stopping logo replacement")
+        # Only reset tracking state when both detection fails AND LK tracking is insufficient
         tracking_state['is_tracking'] = False
         tracking_state['frame_count_since_keyframe'] = 0
 
