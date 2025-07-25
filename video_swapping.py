@@ -1426,6 +1426,12 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 start_timestamp = "00:35:39"
 end_timestamp = "00:36:05"
 
+start_timestamp = "00:50:42"
+end_timestamp = "00:50:48"
+
+start_timestamp = "01:55:12"
+end_timestamp = "01:55:35"
+
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
 tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
@@ -1582,6 +1588,7 @@ while video_stream.isOpened():
         # Decide whether to use MatchAnything or LK tracking
         use_matchanything = False
         reseed_reason = "first_frame"
+        lk_failed = False  # Track if LK tracking failed
 
         if not tracking_state['is_tracking'] or tracking_state['prev_frame_gray'] is None:
             # First frame or tracking was reset
@@ -1605,20 +1612,55 @@ while video_stream.isOpened():
                 use_matchanything = True
                 print(f"Frame {current_frame_number}: 🔄 Reseeding with MatchAnything - {reseed_reason}")
             else:
-                # Continue with LK tracking
-                use_matchanything = False
-                # Update tracking state
-                tracking_state['prev_keypoints_physical'] = tracked_keypoints
-                # Update corresponding SPATEN keypoints (maintain the same valid points)
-                if tracking_state['prev_keypoints_spaten'] is not None:
-                    tracking_state['prev_keypoints_spaten'] = tracking_state['prev_keypoints_spaten'][good_mask]
+                # Check if we have enough points for homography computation
+                if len(tracked_keypoints) < MIN_KP_FOR_HOMOGRAPHY:
+                    use_matchanything = True
+                    lk_failed = True
+                    reseed_reason = f"insufficient_LK_points_{len(tracked_keypoints)}"
+                    print(f"Frame {current_frame_number}: 🔄 LK failed - not enough points for homography ({len(tracked_keypoints)} < {MIN_KP_FOR_HOMOGRAPHY})")
+                else:
+                    # Update tracking state for successful LK tracking
+                    tracking_state['prev_keypoints_physical'] = tracked_keypoints
+                    # Update corresponding SPATEN keypoints (maintain the same valid points)
+                    if tracking_state['prev_keypoints_spaten'] is not None:
+                        tracking_state['prev_keypoints_spaten'] = tracking_state['prev_keypoints_spaten'][good_mask]
 
-                lk_calls += 1
-                print(f"Frame {current_frame_number}: 🎯 LK tracking - {tracking_stats['tracked_points']} points, {tracking_stats['survival_rate']:.1%} survival")
+                    # Check if we still have enough SPATEN points
+                    if len(tracking_state['prev_keypoints_spaten']) < MIN_KP_FOR_HOMOGRAPHY:
+                        use_matchanything = True
+                        lk_failed = True
+                        reseed_reason = f"insufficient_SPATEN_points_{len(tracking_state['prev_keypoints_spaten'])}"
+                        print(f"Frame {current_frame_number}: 🔄 LK failed - not enough SPATEN points for homography")
+                    else:
+                        # Try to compute homography
+                        H_spaten, mask = cv2.findHomography(
+                            tracking_state['prev_keypoints_spaten'],  # Source: SPATEN coordinates
+                            tracking_state['prev_keypoints_physical'],  # Target: full frame coordinates
+                            cv2.USAC_MAGSAC,
+                            ransacReprojThreshold=RANSAC_THRESHOLD,
+                            confidence=0.999,
+                            maxIters=10000
+                        )
+
+                        if H_spaten is None:
+                            use_matchanything = True
+                            lk_failed = True
+                            reseed_reason = "LK_homography_computation_failed"
+                            print(f"Frame {current_frame_number}: 🔄 LK failed - homography computation failed")
+                        else:
+                            # LK tracking successful, continue with tracked points
+                            use_matchanything = False
+                            lk_calls += 1
+                            print(f"Frame {current_frame_number}: 🎯 LK tracking - {tracking_stats['tracked_points']} points, {tracking_stats['survival_rate']:.1%} survival")
         else:
             # No previous keypoints available
             use_matchanything = True
             reseed_reason = "no_previous_keypoints"
+
+        # Reset tracking state if LK failed to force MatchAnything
+        if lk_failed:
+            tracking_state['is_tracking'] = False
+            tracking_state['frame_count_since_keyframe'] = 0
 
         if use_matchanything:
             # Use full MatchAnything pipeline
@@ -1663,74 +1705,56 @@ while video_stream.isOpened():
             ma_calls += 1
             print(f"Frame {current_frame_number}: 🔍 MatchAnything - {reseed_reason}")
         else:
-            # Use LK tracking result to compute homography and replace logo
-            if len(tracking_state['prev_keypoints_physical']) >= MIN_KP_FOR_HOMOGRAPHY and len(tracking_state['prev_keypoints_spaten']) >= MIN_KP_FOR_HOMOGRAPHY:
-                # Compute homography using tracked keypoints
-                H_spaten, mask = cv2.findHomography(
-                    tracking_state['prev_keypoints_spaten'],  # Source: SPATEN coordinates
-                    tracking_state['prev_keypoints_physical'],  # Target: full frame coordinates
-                    cv2.USAC_MAGSAC,
-                    ransacReprojThreshold=RANSAC_THRESHOLD,
-                    confidence=0.999,
-                    maxIters=10000
+            # Use LK tracking result (H_spaten was already computed successfully above)
+            # Apply EKF stabilization
+            if homography_ekf is not None:
+                H_spaten = homography_ekf.update(H_spaten)
+
+            # Store for potential fallback
+            tracking_state['last_homography'] = H_spaten
+
+            # Warp and replace logo using the computed homography
+            frame_h, frame_w = frame_rgb.shape[:2]
+
+            if is_transparent:
+                spaten_warped = cv2.warpPerspective(
+                    spaten_resized[:,:,:3],  # Remove alpha channel for warping
+                    H_spaten,
+                    (frame_w, frame_h)
                 )
-
-                if H_spaten is not None:
-                    # Apply EKF stabilization
-                    if homography_ekf is not None:
-                        H_spaten = homography_ekf.update(H_spaten)
-
-                    # Store for potential fallback
-                    tracking_state['last_homography'] = H_spaten
-
-                    # Warp and replace logo using the computed homography
-                    frame_h, frame_w = frame_rgb.shape[:2]
-
-                    if is_transparent:
-                        spaten_warped = cv2.warpPerspective(
-                            spaten_resized[:,:,:3],  # Remove alpha channel for warping
-                            H_spaten,
-                            (frame_w, frame_h)
-                        )
-                        spaten_alpha_warped = cv2.warpPerspective(
-                            spaten_resized[:,:,3],  # Alpha channel only
-                            H_spaten,
-                            (frame_w, frame_h)
-                        )
-                        mask = spaten_alpha_warped > 0
-                    else:
-                        spaten_warped = cv2.warpPerspective(
-                            spaten_resized,
-                            H_spaten,
-                            (frame_w, frame_h)
-                        )
-                        spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
-                        mask = spaten_gray > 0
-
-                    mask_3d = np.stack([mask, mask, mask], axis=-1)
-
-                    # Replace logo in frame
-                    frame_with_logo = frame_rgb.copy()
-                    frame_with_logo[mask_3d] = spaten_warped[mask_3d]
-
-                    # Apply person occlusion
-                    person_mask = get_person_masks(frame_rgb, person_seg_model, confidence_threshold=0.5, log_timing=False)
-                    result_frame = apply_person_occlusion(frame_with_logo, frame_rgb, person_mask, log_timing=False)
-
-                    if DEBUG:
-                        # Prepare debug info for LK tracking frames
-                        debug_info = {
-                            'bbox': budlight_bbox,
-                            'filtered_keypoints': tracking_state['prev_keypoints_physical'],
-                            'person_mask': person_mask,
-                            'stats': tracking_stats
-                        }
-                else:
-                    print(f"Frame {current_frame_number}: ❌ LK homography computation failed")
-                    result_frame = frame_rgb  # Use original frame
+                spaten_alpha_warped = cv2.warpPerspective(
+                    spaten_resized[:,:,3],  # Alpha channel only
+                    H_spaten,
+                    (frame_w, frame_h)
+                )
+                mask = spaten_alpha_warped > 0
             else:
-                print(f"Frame {current_frame_number}: ❌ Not enough LK points for homography")
-                result_frame = frame_rgb  # Use original frame
+                spaten_warped = cv2.warpPerspective(
+                    spaten_resized,
+                    H_spaten,
+                    (frame_w, frame_h)
+                )
+                spaten_gray = cv2.cvtColor(spaten_warped, cv2.COLOR_RGB2GRAY)
+                mask = spaten_gray > 0
+
+            mask_3d = np.stack([mask, mask, mask], axis=-1)
+
+            # Replace logo in frame
+            frame_with_logo = frame_rgb.copy()
+            frame_with_logo[mask_3d] = spaten_warped[mask_3d]
+
+            # Apply person occlusion
+            person_mask = get_person_masks(frame_rgb, person_seg_model, confidence_threshold=0.5, log_timing=False)
+            result_frame = apply_person_occlusion(frame_with_logo, frame_rgb, person_mask, log_timing=False)
+
+            if DEBUG:
+                # Prepare debug info for LK tracking frames
+                debug_info = {
+                    'bbox': budlight_bbox,
+                    'filtered_keypoints': tracking_state['prev_keypoints_physical'],
+                    'person_mask': person_mask,
+                    'stats': tracking_stats
+                }
 
         # Update tracking state
         tracking_state['prev_frame_gray'] = frame_gray.copy()
