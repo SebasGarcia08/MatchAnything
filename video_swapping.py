@@ -623,16 +623,18 @@ class HomographyEKF:
 MATCHING_CONFIDENCE_THRESHOLD = 0.1
 MAX_KEYPOINTS = 6000
 MIN_KP_FOR_HOMOGRAPHY = 200
-MIN_BBOX_W = 200
+MIN_BBOX_W = 120
 MIN_BBOX_H = 50
-RANSAC_THRESHOLD = 30
+RANSAC_THRESHOLD = 45
 DEBUG = True
+DEBUG_VERBOSE = DEBUG and False
 
 CONF_THR_LOGO_DETECTOR = 0.6
 
 # Optical Flow Tracking Configuration
 KEYFRAME_INTERVAL = 60  # Run MatchAnything every N frames
-MIN_TRACKING_POINTS = 250  # Minimum points to continue tracking
+# TODO: implement min sparse is required for tracked points
+MIN_TRACKING_POINTS = 400  # Minimum points to continue tracking
 MAX_FB_ERROR = 1.0  # Forward-backward error threshold (pixels) - stricter for better quality
 LK_WIN_SIZE = (15, 15)  # LK window size
 LK_MAX_LEVEL = 3  # Pyramid levels
@@ -1481,17 +1483,15 @@ video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEnc
 # 01:55:12-01:55:35 (longer test)
 # 00:50:42_00:50:48 (good conditions)
 # 35:39-00:35:43
-start_timestamp = "00:35:39"
-end_timestamp = "00:36:05"
-
-start_timestamp = "00:50:42"
-end_timestamp = "00:50:48"
 
 start_timestamp = "01:55:12"
 end_timestamp = "01:55:51"
 
 start_timestamp = "00:35:39"
 end_timestamp = "00:36:05"
+
+start_timestamp = "00:50:42"
+end_timestamp = "00:50:48"
 
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
@@ -1614,7 +1614,7 @@ while video_stream.isOpened():
             budlight_bbox = boxes_np.squeeze()
             bbox_w = budlight_bbox[2] - budlight_bbox[0]
             bbox_h = budlight_bbox[3] - budlight_bbox[1]
-            print(f"Frame {current_frame_number}: Detected Budlight logo ({bbox_w}x{bbox_h})")
+            # print(f"Frame {current_frame_number}: Detected Budlight logo ({bbox_w}x{bbox_h})")
 
         # Ensure budlight_bbox is 1D array with 4 elements
         if budlight_bbox.shape != (4,):
@@ -1707,7 +1707,8 @@ while video_stream.isOpened():
             tracking_stats['removed_by_person_mask'] = np.sum(good_mask) - len(person_filtered_keypoints)
             tracking_stats['person_mask_survival_rate'] = len(person_filtered_keypoints) / np.sum(good_mask) if np.sum(good_mask) > 0 else 0.0
 
-            print(f"Frame {current_frame_number}: LK tracking: {np.sum(good_mask)} → {len(person_filtered_keypoints)} points after person mask filtering")
+            if DEBUG_VERBOSE:
+                print(f"Frame {current_frame_number}: LK tracking: {np.sum(good_mask)} → {len(person_filtered_keypoints)} points after person mask filtering")
 
             # Check if we should reseed with MatchAnything
             should_reseed, reseed_reason = should_reseed_keyframe(
@@ -1792,7 +1793,8 @@ while video_stream.isOpened():
                             # LK tracking successful with person filtering, continue with tracked points
                             use_matchanything = False
                             lk_calls += 1
-                            print(f"Frame {current_frame_number}: 🎯 LK tracking with person filtering - {len(person_filtered_keypoints)} points, {tracking_stats['person_mask_survival_rate']:.1%} survived person filter")
+                            if DEBUG_VERBOSE:
+                                print(f"Frame {current_frame_number}: 🎯 LK tracking with person filtering - {len(person_filtered_keypoints)} points, {tracking_stats['person_mask_survival_rate']:.1%} survived person filter")
         else:
             # No previous keypoints available - need MatchAnything with detection
             if budlight_bbox is not None:
@@ -1921,7 +1923,8 @@ while video_stream.isOpened():
             tracking_state['prev_bbox'] = budlight_bbox
         tracking_state['frame_count_since_keyframe'] += 1
 
-        print(f"Frame {current_frame_number}: ✅ Logo processing completed")
+        if DEBUG_VERBOSE:
+            print(f"Frame {current_frame_number}: ✅ Logo processing completed")
     else:
         print(f"Frame {current_frame_number}: ❌ No detection and insufficient LK tracking - stopping logo replacement")
         # Only reset tracking state when both detection fails AND LK tracking is insufficient
@@ -1949,7 +1952,8 @@ while video_stream.isOpened():
         debug_info
     )
 
-    print(f"Frame {current_frame_number}: Processing time: {frame_time:.3f}s, FPS: {fps:.1f}")
+    if DEBUG_VERBOSE:
+        print(f"Frame {current_frame_number}: Processing time: {frame_time:.3f}s, FPS: {fps:.1f}")
 
     current_frame_number += 1
 
