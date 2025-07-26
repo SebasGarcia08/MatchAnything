@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import pickle
 import os
+import os.path as osp
 import torch
 from typing import TypedDict, Optional, List, Tuple, Union
 import logging
@@ -19,6 +20,8 @@ from filterpy.common import Q_discrete_white_noise
 
 # Add the necessary paths
 sys.path.append(str(Path(__file__).parent))
+
+logger = logging.getLogger(__name__)
 
 from imcui.ui.utils import load_config, get_matcher_zoo, run_matching
 from imcui.ui.viz import display_keypoints, display_matches
@@ -33,6 +36,8 @@ from imcui.ui.utils import (
     get_model, proc_ransac_matches, set_null_pred,
     DEFAULT_MIN_NUM_MATCHES, ransac_zoo, DEFAULT_RANSAC_METHOD
 )
+
+PROJECT_DIR = "/home/sebastian/swappr"
 
 
 # Raw match prediction
@@ -853,7 +858,7 @@ if is_transparent != loaded_is_transparent:
     is_transparent = loaded_is_transparent
 
 # Load person segmentation model
-seg_model_path = "/home/sebastiangarcia/projects/swappr/yolo11n-seg.pt"
+seg_model_path = osp.join(PROJECT_DIR, "yolo11n-seg.pt")
 print(f"Loading YOLO segmentation model from: {seg_model_path}")
 person_seg_model = YOLO(seg_model_path)
 print(f"YOLO segmentation model loaded successfully!")
@@ -1647,7 +1652,7 @@ if EKF_ENABLED:
 print("Simple frame-by-frame processing ready!")
 
 # Video processing parameters
-video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEncode_swappr_317.ts"
+video_path = osp.join(PROJECT_DIR, "data/poc/UFC317/BrazilPriEncode_swappr_317.ts")
 
 # Test segments with good logo visibility
 # 01:26:05-01:26:17 (good logo visibility)
@@ -1669,9 +1674,12 @@ end_timestamp = "00:36:05"
 start_timestamp = "00:50:42"
 end_timestamp = "00:51:28"
 
+start_timestamp = "00:50:42"
+end_timestamp = "00:50:48"
+
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
-yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
-tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
+yolo_model_path = osp.join(PROJECT_DIR, "models/poc/v2_budlight_logo_detection/weights/best.pt")
+tracker_config_path = osp.join(PROJECT_DIR, "configs/trackers/bytetrack.yaml")
 
 det_model_budlight = YOLO(yolo_model_path)
 video_stream = cv2.VideoCapture(video_path)
