@@ -468,8 +468,8 @@ class DebugVisualizer:
         """
         if not self.enable_debug:
             # Simple OpenCV display
-            cv2.imshow('Logo Replacement Result', cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR))
-            cv2.waitKey(1)
+            #cv2.imshow('Logo Replacement Result', cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR))
+            #cv2.waitKey(1)
             return
 
         if self.axes is None or self.fig is None:
