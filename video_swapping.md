@@ -1161,3 +1161,88 @@ The hybrid MatchAnything + LK tracking system represents a significant advanceme
 This implementation provides a production-ready foundation for advanced logo replacement applications while maintaining the flexibility to enhance specific components based on evolving requirements. The hybrid approach successfully addresses the fundamental trade-off between computational efficiency and output quality that has limited previous approaches.
 
 The system's sophisticated person occlusion handling, temporal stability features, and robust error recovery make it suitable for demanding professional applications where both performance and quality are critical requirements.
+
+
+2 seconds delay @ 30 FPS = 60 max frames of buffer
+
+past_frames: [f_{t-N}, f_{t-N-1}, ... f_[t-1]], N frames before
+future_frames: [f_{t+1}, f_{t+2}, ..., f_{t+M}], M frames of lookahead
+current frame f_t
+frame_buffer: [past_frames, ..., current_frame, ..., future_frames], N + M + 1
+frame_buffer = [0, 1, ... , N, N + 1, N + 2, ... , N + M]
+
+Using 1 second of buffer: we have 30 frames of room, N = 14, M = 15
+
+At the beginning: skip processing the first N frames, because we're going to use them to fill the buffer
+for the past frames.
+
+So, streaming starts, we capture the first N + M + 1 frames and add them to the frame_buffer.
+We start processing the middle Nth frame (0-indexed), which means that we won't process the first N frames of the whole streaming
+because we'll use them as past frames to process the middle frame.
+
+
+Configs:
+    - `MIN_LOGO_AREA_FOR_KP_DETECTION`
+
+Important detail:
+
+0. In the buffer state we keep track of the boundaries of the current buffer:
+    0.1 `start_frame_index` the index of the first frame in the buffer (inclusive)
+    0.2 `end_frame_index` the index of the last frame in the buffer + 1 (exclusive), `end_frame_index = start_frame_index + N + M + 1 `
+    0.3 That means that for the first buffer this is start_frame_index = 0, end end_frame_index = 0 + 14 + 15 + 1
+
+1. [NEW] Before we were applying swapping to all the frames reardless of the scene, but now we need to decide whether or not to apply swapping to that whole scene by looking at the first frame of a new scene.
+    1.1 If the first frame of a new scene contains the logo we  want to swap (logo detected)
+    1.2 And the logo is visible enough (logo area above min % visibility threshold)
+    1.3 Apply same criteria applied to determine whether to swap or not
+    1.4 Save this information in a flag "should_swap"
+
+2. If we determine that we can swap, then we will apply swapping to that whole scene. Otherwise, we won't swap any frame of that scene.
+    2.1 We can keep in the state the last frame index in which we detected the last scene
+
+3. Regardless of should_swap, we need to always look for scene changes.
+    3.1. Keep `prev_scene_frame_index` and `next_scene_frame_index`.
+    3.2. `prev_scene_frame_index`: stores the index of the last time we detected a scene (< current_frame_index)
+    3.3. `next_scene_frame_index`: stores the index of a scene that was detected after the current index (> current_frame_index)
+
+4 If we are swapping:
+
+    4.1 We need to first define the frame indexes that we can use to perform swapping.
+        For example, if we are going to swap the first frame of a new scene, we cannot use information
+        from frames prior to that because they are from a different scene.
+        Likewise, if we are processing the last frame of a scene, we cannot use frames after that scene
+        because are from a different camera viewpoint.
+        Use `prev_scene_frame_index` and  `next_scene_frame_index` to determine the buffer frames.
+
+    4.2 For all the frames used to swap the current frame, we need to:
+
+        4.2.1 Process in batch and asynchronously each of the following on the GPU:
+            4.2.1.1 Detect bounding boxes of the logo to swap (Budlight for example)
+            4.2.1.3 Get segmentation masks for the graphics, people, and all octagon logos (use bisenet v1)
+
+        4.2.2 We need to post-process the bounding boxes and segmentations across the batch:
+            4.2.2.1 We get the segmentation mask for the logo to swap (Budlight for example) in every frame of the buffer
+                by getting the segmentation mask for each frame that overlaps with the bounding box detected for that frame.
+
+        4.2.3 Keypoint seeding: we keep the last frame index in which we seeded the key points with the matching model in `last_frame_seeded`
+            4.2.3 We determine the frames in the buffer, e.g., all frames with index i such that `start_frame_index <= i < end_frame_index`, and we 
+                need to reseed `i - last_frame_seeded > KEYFRAME_INTERVAL`.
+            4.2.4 Matching model image pre-processing, for each of the frames used to reseed:
+                4.2.4.1 We use the segmentation mask of the logo to swap (Budlight) to crop the specific part of the frame to show to matching model.
+                4.2.4.2 We also use the mask of people and graphics (visual elements that could occlude the physical logo) to exclude them from the image
+                    to use with the matching model.
+                4.2.4.3 Finally, we get a binary budlight logo mask where pixels with a value of 1 are parts of the logo that are fully visible.
+                        Pixels that are coming from fighters, graphics or are not coming from the logo mask, are set to 0.
+                4.2.4.4 We use this mask to get a final image to show to the matching model that only includes visible logo parts.
+                4.2.4.5 Compare the percentage of the visible area w.r.t. the logo bbox a threshold `MIN_LOGO_AREA_FOR_KP_DETECTION`
+                    4.2.4.5.1 If it's less than the threshold, it means that the logo is occluded. Otherwise, it's visible enough.
+                            Save this information for each of the frames use for re-seed
+            4.2.5. For all frames to reseed where the logo is visible: run keypoint detection with matching model in parallel
+            
+
+
+
+Once the frame buffer is filled, we will process the middle frame:
+
+1. Detect scene cuts in the buffer: if changed, get the index in the frame in which the scene changed. Otherwise, continue.
+

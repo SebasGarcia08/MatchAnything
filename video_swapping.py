@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import pickle
 import os
+import os.path as osp
 import torch
 from typing import TypedDict, Optional, List, Tuple, Union
 import logging
@@ -19,6 +20,8 @@ from filterpy.common import Q_discrete_white_noise
 
 # Add the necessary paths
 sys.path.append(str(Path(__file__).parent))
+
+logger = logging.getLogger(__name__)
 
 from imcui.ui.utils import load_config, get_matcher_zoo, run_matching
 from imcui.ui.viz import display_keypoints, display_matches
@@ -33,6 +36,16 @@ from imcui.ui.utils import (
     get_model, proc_ransac_matches, set_null_pred,
     DEFAULT_MIN_NUM_MATCHES, ransac_zoo, DEFAULT_RANSAC_METHOD
 )
+
+# Try to import VPI for CUDA acceleration
+try:
+    import vpi  # NVIDIA Vision Programming Interface
+    VPI_AVAILABLE = True
+except ImportError:
+    VPI_AVAILABLE = False
+    vpi = None
+
+PROJECT_DIR = "/home/sebastian/swappr"
 
 
 # Raw match prediction
@@ -60,7 +73,6 @@ class FilteredMatchPrediction(MatchPrediction):
     mmkeypoints0_orig: np.ndarray  # RANSAC filtered matches in original image0 coordinates
     mmkeypoints1_orig: np.ndarray  # RANSAC filtered matches in original image1 coordinates
     mmconf: np.ndarray  # confidence scores for RANSAC filtered matches
-
 
 def check_bbox_person_overlap(bbox: np.ndarray, person_mask: np.ndarray,
                              overlap_threshold: float = 0.1) -> tuple[bool, float]:
@@ -455,8 +467,8 @@ class DebugVisualizer:
         """
         if not self.enable_debug:
             # Simple OpenCV display
-            cv2.imshow('Logo Replacement Result', cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR))
-            cv2.waitKey(1)
+            #cv2.imshow('Logo Replacement Result', cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR))
+            #cv2.waitKey(1)
             return
 
         if self.axes is None or self.fig is None:
@@ -793,7 +805,7 @@ MIN_BBOX_W = 120
 MIN_BBOX_H = 50
 RANSAC_THRESHOLD = 45
 DEBUG = True
-DEBUG_VERBOSE = DEBUG and False
+DEBUG_VERBOSE = True
 
 CONF_THR_LOGO_DETECTOR = 0.6
 
@@ -853,7 +865,7 @@ if is_transparent != loaded_is_transparent:
     is_transparent = loaded_is_transparent
 
 # Load person segmentation model
-seg_model_path = "/home/sebastiangarcia/projects/swappr/yolo11n-seg.pt"
+seg_model_path = osp.join(PROJECT_DIR, "yolo11n-seg.pt")
 print(f"Loading YOLO segmentation model from: {seg_model_path}")
 person_seg_model = YOLO(seg_model_path)
 print(f"YOLO segmentation model loaded successfully!")
@@ -1327,6 +1339,115 @@ def track_keypoints_lk(prev_gray: np.ndarray,
 
     return tracked_keypoints, good_mask, tracking_stats
 
+def track_keypoints_lk_vpi(
+        prev_gray      : np.ndarray,
+        curr_gray      : np.ndarray,
+        prev_keypoints : np.ndarray,
+        log_timing     : bool = False,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Track keypoints using VPI's CUDA Pyramidal Lucas-Kanade optical flow with
+    a forward–backward consistency check (API-compatible with the OpenCV
+    reference implementation).
+
+    Args
+    ----
+    prev_gray      : H×W uint8 grayscale image of previous frame.
+    curr_gray      : H×W uint8 grayscale image of current  frame.
+    prev_keypoints : (N,2) float32 array with (x,y) coordinates from prev frame.
+    log_timing     : If True, prints timing and basic stats.
+
+    Returns
+    -------
+    tracked_keypoints : (M,2) float32 array with points that survived checks.
+    good_mask         : (N,)   bool   array, True where point is valid.
+    tracking_stats    : dict   with totals, survival-rate and FB error metrics.
+    """
+    # Fallback to CPU implementation if VPI is not available
+    if not VPI_AVAILABLE or vpi is None:
+        if log_timing:
+            print("VPI not available, falling back to CPU implementation")
+        return track_keypoints_lk(prev_gray, curr_gray, prev_keypoints, log_timing)
+
+    try:
+        if prev_keypoints.size == 0:                                # early exit
+            empty = np.empty((0, 2), np.float32)
+            return empty, np.zeros(0, bool), {
+                "total_points": 0, "tracked_points": 0,
+                "survival_rate": 0.0, "avg_fb_error": float("inf"),
+                "max_fb_error": float("inf")
+            }
+
+        if log_timing:
+            t0 = time.time()
+
+        # --------------------------- VPI containers ------------------------------
+        with vpi.Backend.CUDA:                                       # use GPU
+            prev_img = vpi.asimage(prev_gray, vpi.Format.U8)
+            curr_img = vpi.asimage(curr_gray, vpi.Format.U8)
+
+            # Wrap keypoints as VPI array of type KEYPOINT_F32
+            kp_prev = vpi.asarray(prev_keypoints.astype(np.float32),
+                                  vpi.Type.KEYPOINT_F32)
+
+            # ----------------------- forward pass -------------------------------
+            optflow_fwd = vpi.OpticalFlowPyrLK(prev_img,
+                                               kp_prev,
+                                               LK_MAX_LEVEL)
+            kp_curr_vpi, status_fwd = optflow_fwd(curr_img)
+
+            # Copy CUDA results back to CPU numpy arrays
+            with kp_curr_vpi.rlock_cpu() as _kp_cur_cpu, \
+                 status_fwd.rlock_cpu()   as _st_f_cpu:
+                kp_curr_np  = _kp_cur_cpu.copy()
+                st_forward  = _st_f_cpu.copy()                       # 0 ⇒ OK
+
+            # ---------------------- backward pass -------------------------------
+            kp_curr_as_prev = vpi.asarray(kp_curr_np.astype(np.float32),
+                                          vpi.Type.KEYPOINT_F32)
+
+            optflow_bwd = vpi.OpticalFlowPyrLK(curr_img,
+                                               kp_curr_as_prev,
+                                               LK_MAX_LEVEL)    # same params
+            kp_prev_back_vpi, status_bwd = optflow_bwd(prev_img)
+
+            with kp_prev_back_vpi.rlock_cpu() as _p0_back_cpu, \
+                 status_bwd.rlock_cpu()       as _st_b_cpu:
+                p0_back     = _p0_back_cpu.copy()
+                st_backward = _st_b_cpu.copy()
+
+        # --------------------- consistency check on CPU --------------------------
+        fb_error      = np.linalg.norm(p0_back - prev_keypoints, axis=1)
+        good_forward  = st_forward.flatten()  == 0
+        good_backward = st_backward.flatten() == 0
+        good_fb_error = fb_error < MAX_FB_ERROR
+        good_mask     = good_forward & good_backward & good_fb_error
+
+        tracked_keypoints = kp_curr_np[good_mask]
+
+        tracking_stats = {
+            "total_points" : len(prev_keypoints),
+            "tracked_points": len(tracked_keypoints),
+            "survival_rate" : len(tracked_keypoints) / len(prev_keypoints),
+            "avg_fb_error"  : float(np.mean(fb_error[good_mask])) if good_mask.any() else float('inf'),
+            "max_fb_error"  : float(np.max(fb_error[good_mask])) if good_mask.any() else float('inf'),
+        }
+
+        if log_timing:
+            dt = time.time() - t0
+            print(f"VPI-LK tracking completed in {dt:.3f}s "
+                  f"({tracking_stats['tracked_points']}/{tracking_stats['total_points']} points, "
+                  f"{tracking_stats['survival_rate']*100:.1f}% kept, "
+                  f"avg FB error {tracking_stats['avg_fb_error']:.2f}px)")
+
+        return tracked_keypoints.astype(np.float32), good_mask, tracking_stats
+
+    except Exception as e:
+        if log_timing:
+            logger.exception(f"VPI tracking failed: {e}, falling back to CPU implementation")
+        return track_keypoints_lk(prev_gray, curr_gray, prev_keypoints, log_timing)
+
+
 def should_reseed_keyframe(tracking_stats: dict, frame_count: int) -> tuple[bool, str]:
     """
     Determine if we should reseed with MatchAnything based on tracking quality.
@@ -1647,7 +1768,7 @@ if EKF_ENABLED:
 print("Simple frame-by-frame processing ready!")
 
 # Video processing parameters
-video_path = "/home/sebastiangarcia/projects/swappr/data/poc/UFC317/BrazilPriEncode_swappr_317.ts"
+video_path = osp.join(PROJECT_DIR, "data/poc/UFC317/BrazilPriEncode_swappr_317.ts")
 
 # Test segments with good logo visibility
 # 01:26:05-01:26:17 (good logo visibility)
@@ -1669,9 +1790,10 @@ end_timestamp = "00:36:05"
 start_timestamp = "00:50:42"
 end_timestamp = "00:51:28"
 
+
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
-yolo_model_path = "/home/sebastiangarcia/projects/swappr/models/poc/v2_budlight_logo_detection/weights/best.pt"
-tracker_config_path = "/home/sebastiangarcia/projects/swappr/configs/trackers/bytetrack.yaml"
+yolo_model_path = osp.join(PROJECT_DIR, "models/poc/v2_budlight_logo_detection/weights/best.pt")
+tracker_config_path = osp.join(PROJECT_DIR, "configs/trackers/bytetrack.yaml")
 
 det_model_budlight = YOLO(yolo_model_path)
 video_stream = cv2.VideoCapture(video_path)
@@ -1871,11 +1993,11 @@ while video_stream.isOpened():
                 continue
         elif tracking_state['prev_keypoints_physical'] is not None and len(tracking_state['prev_keypoints_physical']) > 0:
             # We have previous keypoints, try LK tracking first
-            tracked_keypoints, good_mask, tracking_stats = track_keypoints_lk(
+            tracked_keypoints, good_mask, tracking_stats = track_keypoints_lk_vpi(
                 tracking_state['prev_frame_gray'],
                 frame_gray,
                 tracking_state['prev_keypoints_physical'],
-                log_timing=False
+                log_timing=True
             )
 
             # Filter out keypoints that overlap with people to avoid tracking people instead of logo
