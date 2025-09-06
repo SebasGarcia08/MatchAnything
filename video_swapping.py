@@ -74,7 +74,6 @@ class FilteredMatchPrediction(MatchPrediction):
     mmkeypoints1_orig: np.ndarray  # RANSAC filtered matches in original image1 coordinates
     mmconf: np.ndarray  # confidence scores for RANSAC filtered matches
 
-
 def check_bbox_person_overlap(bbox: np.ndarray, person_mask: np.ndarray,
                              overlap_threshold: float = 0.1) -> tuple[bool, float]:
     """
@@ -806,7 +805,7 @@ MIN_BBOX_W = 120
 MIN_BBOX_H = 50
 RANSAC_THRESHOLD = 45
 DEBUG = True
-DEBUG_VERBOSE = DEBUG and False
+DEBUG_VERBOSE = True
 
 CONF_THR_LOGO_DETECTOR = 0.6
 
@@ -1791,8 +1790,6 @@ end_timestamp = "00:36:05"
 start_timestamp = "00:50:42"
 end_timestamp = "00:51:28"
 
-start_timestamp = "00:50:42"
-end_timestamp = "00:50:48"
 
 output_video_path = f"swapped_{model_type}_hybrid_lk_{start_timestamp}_{end_timestamp}.mp4"
 yolo_model_path = osp.join(PROJECT_DIR, "models/poc/v2_budlight_logo_detection/weights/best.pt")
